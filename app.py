@@ -187,6 +187,70 @@ def ensure_gps_datetime(df):
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     return df
 
+def week_start(date_like):
+    d = pd.to_datetime(date_like, errors="coerce")
+    if pd.isna(d):
+        return pd.NaT
+    return (d - pd.to_timedelta(d.weekday(), unit="D")).normalize()
+
+def integrated_week_fatigue_summary(metrics_df, selected_date):
+    if metrics_df is None or metrics_df.empty:
+        return {
+            "fatigue_sessions": 0,
+            "readiness_mean": np.nan,
+            "loss_mean": np.nan,
+            "moderate_or_worse": 0,
+            "critical": 0,
+        }
+    df = metrics_df.copy()
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    ws = week_start(selected_date)
+    we = ws + pd.Timedelta(days=6)
+    week_df = df[(df["Fecha"] >= ws) & (df["Fecha"] <= we)].copy()
+    if week_df.empty:
+        return {
+            "fatigue_sessions": 0,
+            "readiness_mean": np.nan,
+            "loss_mean": np.nan,
+            "moderate_or_worse": 0,
+            "critical": 0,
+        }
+    by_session = week_df.groupby(["Fecha", "Microciclo"], dropna=False).agg(
+        readiness_score=("readiness_score", "mean"),
+        objective_loss_score=("objective_loss_score", "mean"),
+        mod_or_worse=("risk_label", lambda s: int(pd.Series(s).isin(["Fatiga moderada","Fatiga moderada-alta","Fatiga crítica"]).sum())),
+        critical=("risk_label", lambda s: int((pd.Series(s) == "Fatiga crítica").sum())),
+    ).reset_index()
+    return {
+        "fatigue_sessions": int(len(by_session)),
+        "readiness_mean": float(by_session["readiness_score"].mean()) if len(by_session) else np.nan,
+        "loss_mean": float(by_session["objective_loss_score"].mean()) if len(by_session) else np.nan,
+        "moderate_or_worse": int(by_session["mod_or_worse"].sum()),
+        "critical": int(by_session["critical"].sum()),
+    }
+
+def integrated_week_text(metrics_df, gps_df, selected_date):
+    fat = integrated_week_fatigue_summary(metrics_df, selected_date)
+    gps_df = ensure_gps_datetime(gps_df)
+    if gps_df.empty:
+        gps_sessions = 0
+        gps_compliance = np.nan
+    else:
+        ws = week_start(selected_date)
+        we = ws + pd.Timedelta(days=6)
+        gps_week = gps_compute_compliance(gps_df[(gps_df["Fecha"] >= ws) & (gps_df["Fecha"] <= we)].copy())
+        gps_sessions = gps_week[["Fecha","Microciclo"]].drop_duplicates().shape[0] if not gps_week.empty else 0
+        gps_compliance = float(gps_week["compliance_score"].mean()) if (not gps_week.empty and "compliance_score" in gps_week.columns) else np.nan
+    rtxt = "NA" if pd.isna(fat["readiness_mean"]) else f"{fat['readiness_mean']:.1f}"
+    ltxt = "NA" if pd.isna(fat["loss_mean"]) else f"{fat['loss_mean']:.2f}"
+    gtxt = "NA" if pd.isna(gps_compliance) else f"{gps_compliance:.1f}%"
+    return (
+        f"Semana integrada: {fat['fatigue_sessions']} controles de fatiga y {gps_sessions} sesiones GPS. "
+        f"Readiness media semanal: {rtxt}. Objective loss medio semanal: {ltxt}. "
+        f"Cumplimiento GPS medio semanal: {gtxt}. "
+        f"Casos moderados o peores acumulados: {fat['moderate_or_worse']}. Críticos: {fat['critical']}."
+    )
+
 def upsert_monitoring(df):
     if df.empty:
         return
@@ -1492,7 +1556,7 @@ def coach_session_html(team_day, selected_date, gps_df=None):
       <div class="card"><div class="label">Pérdida media %</div><div class="value">{team_day['objective_loss_mean_pct'].mean():.1f}%</div></div>
       <div class="card"><div class="label">Readiness media</div><div class="value">{team_day['readiness_score'].mean():.0f}</div></div>
     </div>
-    <div class="section"><div class="title">Lectura rápida para el entrenador</div><div class="diag">{team_interpretation(team_day)}</div><p class="diag" style="margin-top:8px;"><b>Resumen pre-entrenamiento:</b> {pretraining_text(team_day)}</p></div>
+    <div class="section"><div class="title">Lectura rápida para el entrenador</div><div class="diag">{team_interpretation(team_day)}</div><p class="diag" style="margin-top:8px;"><b>Resumen pre-entrenamiento:</b> {pretraining_text(team_day)}</p><p class="diag" style="margin-top:8px;"><b>Control semanal integrado:</b> {integrated_week_text(globals().get('LAST_METRICS_DF', pd.DataFrame()), globals().get('LAST_GPS_DF', pd.DataFrame()), selected_date)}</p></div>
     <div class="section"><div class="title">Panel visual</div><div class="grid2">{risk_html}{bar_html}</div></div>
     <div class="section"><div class="title">Resumen por jugador</div><table class="report-table"><thead><tr><th>Jugador</th><th>Riesgo</th><th>CMJ %</th><th>RSI mod %</th><th>VMP %</th><th>Pérdida media %</th><th>Loss score</th></tr></thead><tbody>{rows}</tbody></table></div>
     </body></html>
@@ -1761,39 +1825,59 @@ def page_equipo(metrics_df, gps_df):
         st.info("No hay datos disponibles.")
         return
 
-    st.markdown('<div class="hero"><div style="font-size:0.92rem; opacity:0.9;">Monitorización integrada</div><div style="font-size:2.05rem; font-weight:900; margin-top:0.15rem;">Equipo</div><div style="font-size:1rem; opacity:0.92; margin-top:0.4rem;">Lectura global de fatiga neuromuscular y cumplimiento GPS.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><div style="font-size:0.92rem; opacity:0.9;">Monitorización neuromuscular + GPS</div><div style="font-size:2.05rem; font-weight:900; margin-top:0.15rem;">Equipo</div><div style="font-size:1rem; opacity:0.92; margin-top:0.4rem;">Lectura integrada del estado diario y semanal del grupo.</div></div>', unsafe_allow_html=True)
 
-    date_candidates = []
+    all_dates = []
     if not metrics_df.empty:
-        date_candidates += [pd.to_datetime(d).strftime("%Y-%m-%d") for d in sorted(metrics_df["Fecha"].dropna().unique())]
+        all_dates.extend(list(pd.to_datetime(metrics_df["Fecha"], errors="coerce").dropna().unique()))
     if not gps_df.empty:
-        date_candidates += [pd.to_datetime(d).strftime("%Y-%m-%d") for d in sorted(gps_df["Fecha"].dropna().unique())]
-    opts = sorted(set(date_candidates))
+        gps_df = ensure_gps_datetime(gps_df)
+        all_dates.extend(list(pd.to_datetime(gps_df["Fecha"], errors="coerce").dropna().unique()))
+    all_dates = sorted(pd.unique(all_dates))
+    if not all_dates:
+        st.info("No hay fechas disponibles.")
+        return
+
+    opts = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in all_dates]
     selected_date = pd.to_datetime(st.selectbox("Fecha de análisis", opts, index=len(opts)-1))
+
+    gps_df = ensure_gps_datetime(gps_df)
     team_day = metrics_df[metrics_df["Fecha"].dt.normalize() == selected_date.normalize()].copy() if not metrics_df.empty else pd.DataFrame()
-    gps_day = gps_compute_compliance(ensure_gps_datetime(gps_df)[ensure_gps_datetime(gps_df)["Fecha"].dt.normalize() == selected_date.normalize()].copy()) if not gps_df.empty else pd.DataFrame()
+    gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.normalize() == selected_date.normalize()].copy()) if not gps_df.empty else pd.DataFrame()
 
     c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
-    with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), f"{team_day['Jugador'].nunique() if not team_day.empty else gps_day['Jugador'].nunique()} jugadores")
-    with c2: kpi("Readiness media", "NA" if team_day.empty else f"{team_day['readiness_score'].mean():.1f}", "0-100")
+    with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), f"{team_day['Jugador'].nunique() if not team_day.empty else 0} jugadores fatiga")
+    with c2: kpi("Readiness media sesión", "NA" if team_day.empty else f"{team_day['readiness_score'].mean():.1f}", "0-100")
     with c3: kpi("Objective loss medio", "NA" if team_day.empty else f"{team_day['objective_loss_score'].mean():.2f}", "0-3")
     with c4: kpi("Pérdida media %", "NA" if team_day.empty else f"{team_day['objective_loss_mean_pct'].mean():.1f}%", "grupo")
     with c5:
         z_mean = team_day["objective_z_score"].mean() if (not team_day.empty and "objective_z_score" in team_day.columns) else np.nan
         kpi("Z-score objetivo", "NA" if pd.isna(z_mean) else f"{z_mean:.2f}", "media grupo")
-    with c6: kpi("GPS sesión", "Sí" if not gps_day.empty else "No", "disponible")
-    with c7: kpi("Partido ref.", "Sí" if not build_match_profile(gps_df).empty else "No", "GPS")
+    with c6:
+        gps_comp = gps_day["compliance_score"].mean() if (not gps_day.empty and "compliance_score" in gps_day.columns) else np.nan
+        kpi("Cumplimiento GPS día", "NA" if pd.isna(gps_comp) else f"{gps_comp:.1f}%", "sesión")
+    with c7: kpi("Casos críticos", int((team_day["risk_label"] == "Fatiga crítica").sum()) if not team_day.empty else 0, "prioridad")
 
     if not team_day.empty:
         st.success(team_interpretation(team_day))
-        st.info("Resumen pre-entrenamiento: " + pretraining_text(team_day))
-        s = pretraining_summary(team_day)
-        p1,p2,p3,p4 = st.columns(4)
-        with p1: kpi("Disponibles", s.get("disponibles_normales", 0), "normal")
-        with p2: kpi("Con control", s.get("control", 0), "monitorizar")
-        with p3: kpi("Ajustar carga", s.get("ajustar", 0), "reducir exposición")
-        with p4: kpi("Individualizar", s.get("individualizar", 0), "máxima atención")
+    st.info("Control semanal integrado: " + integrated_week_text(metrics_df, gps_df, selected_date))
 
+    fat_week = integrated_week_fatigue_summary(metrics_df, selected_date)
+    gps_week = pd.DataFrame()
+    if not gps_df.empty:
+        ws = week_start(selected_date)
+        we = ws + pd.Timedelta(days=6)
+        gps_week = gps_compute_compliance(gps_df[(gps_df["Fecha"] >= ws) & (gps_df["Fecha"] <= we)].copy())
+
+    w1,w2,w3,w4 = st.columns(4)
+    with w1: kpi("Readiness media semanal", "NA" if pd.isna(fat_week["readiness_mean"]) else f"{fat_week['readiness_mean']:.1f}", "fatiga")
+    with w2: kpi("Loss medio semanal", "NA" if pd.isna(fat_week["loss_mean"]) else f"{fat_week['loss_mean']:.2f}", "fatiga")
+    with w3:
+        gps_week_comp = gps_week["compliance_score"].mean() if (not gps_week.empty and "compliance_score" in gps_week.columns) else np.nan
+        kpi("Cumplimiento GPS semanal", "NA" if pd.isna(gps_week_comp) else f"{gps_week_comp:.1f}%", "media semana")
+    with w4: kpi("Sesiones semana", int(fat_week["fatigue_sessions"]) + int(gps_week[["Fecha","Microciclo"]].drop_duplicates().shape[0] if not gps_week.empty else 0), "fatiga + GPS")
+
+    if not team_day.empty:
         a,b = st.columns(2)
         with a: st.plotly_chart(plot_team_risk_distribution(team_day), use_container_width=True)
         with b: st.plotly_chart(plot_team_score_trend(metrics_df), use_container_width=True)
@@ -1802,20 +1886,20 @@ def page_equipo(metrics_df, gps_df):
         with d: st.plotly_chart(plot_team_objective_bar(team_day), use_container_width=True)
         st.plotly_chart(plot_team_decision_matrix(team_day), use_container_width=True)
 
-    if not gps_day.empty:
-        st.markdown("## GPS · cumplimiento de la sesión")
-        gps_table = gps_day[["Jugador","Posicion","Microciclo"] + [f"{m}_pct_match" for m in GPS_METRICS]].copy()
-        rename = {"Jugador":"Jugador","Posicion":"Posición","Microciclo":"Día"}
-        rename.update({f"{m}_pct_match": f"{GPS_LABELS[m]} %" for m in GPS_METRICS})
-        gps_table = gps_table.rename(columns=rename)
-        st.dataframe(gps_table.round(1), use_container_width=True, hide_index=True)
-
-    if not team_day.empty:
-        table = team_day[["Jugador","CMJ_pct_vs_baseline","RSI_mod_pct_vs_baseline","VMP_pct_vs_baseline","objective_loss_mean_pct","objective_loss_score","objective_z_score","readiness_score","risk_label","trend_label","decision_label","availability_label","dominant_profile","recent_alerts_14d"]].copy()
-        table.columns = ["Jugador","CMJ %","RSI mod %","VMP %","Pérdida media %","Loss score","Z-score objetivo","Readiness","Riesgo","Tendencia","Decisión","Disponibilidad","Perfil dominante","Alertas 14d"]
+        table = team_day[["Jugador","Microciclo","CMJ_pct_vs_baseline","RSI_mod_pct_vs_baseline","VMP_pct_vs_baseline","objective_loss_mean_pct","objective_loss_score","objective_z_score","readiness_score","risk_label","trend_label","decision_label","availability_label","dominant_profile","recent_alerts_14d"]].copy()
+        table.columns = ["Jugador","Día","CMJ %","RSI mod %","VMP %","Pérdida media %","Loss score","Z-score objetivo","Readiness","Riesgo","Tendencia","Decisión","Disponibilidad","Perfil dominante","Alertas 14d"]
         for col in ["CMJ %","RSI mod %","VMP %","Pérdida media %","Loss score","Z-score objetivo","Readiness"]:
             table[col] = table[col].round(2)
         st.dataframe(table.sort_values(["Loss score","Pérdida media %"], ascending=[False, True]), use_container_width=True, hide_index=True)
+
+    if not gps_day.empty:
+        st.markdown("### GPS del día")
+        gps_show = gps_day[["Jugador","Posicion","Microciclo","compliance_score","session_status","hsr_pct","sprints_pct","distance_vrange6_pct","num_acc_pct","num_dec_pct"]].copy()
+        gps_show.columns = ["Jugador","Posición","Día","Cumplimiento %","Estado","HSR %","Sprints %","Distancia sprint %","ACC %","DEC %"]
+        for c in ["Cumplimiento %","HSR %","Sprints %","Distancia sprint %","ACC %","DEC %"]:
+            gps_show[c] = gps_show[c].round(1)
+        st.dataframe(gps_show.sort_values(["Cumplimiento %"], ascending=False), use_container_width=True, hide_index=True)
+
 
 def page_jugador(metrics_df, gps_df):
     if metrics_df.empty and gps_df.empty:
@@ -1977,8 +2061,13 @@ def page_admin(base_df, gps_df):
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi("Registros fatiga", len(base_df), "total")
     with c2: kpi("Jugadores fatiga", base_df["Jugador"].nunique() if not base_df.empty else 0, "únicos")
-    with c3: kpi("Sesiones GPS", len(ensure_gps_datetime(gps_df)[["Fecha","Microciclo"]].drop_duplicates()) if not gps_df.empty else 0, "guardadas")
-    with c4: kpi("Jugadores GPS", gps_df["Jugador"].nunique() if not gps_df.empty else 0, "únicos")
+    with c3:
+        gps_df = ensure_gps_datetime(gps_df)
+        gps_micro = gps_df[gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy() if not gps_df.empty else pd.DataFrame()
+        kpi("Sesiones GPS microciclo", len(gps_micro[["Fecha","Microciclo"]].drop_duplicates()) if not gps_micro.empty else 0, "guardadas")
+    with c4:
+        gps_matches = gps_df[gps_df["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy() if not gps_df.empty else pd.DataFrame()
+        kpi("Partidos GPS", len(gps_matches["Fecha"].drop_duplicates()) if not gps_matches.empty else 0, "guardados")
 
     if not base_df.empty:
         st.download_button("Descargar base fatiga CSV", data=base_df.to_csv(index=False).encode("utf-8"), file_name="fatiga.csv", mime="text/csv")
@@ -2002,17 +2091,28 @@ def page_admin(base_df, gps_df):
                 st.rerun()
 
     if not gps_df.empty:
-        gps_df = ensure_gps_datetime(gps_df)
         st.download_button("Descargar base GPS CSV", data=gps_df.to_csv(index=False).encode("utf-8"), file_name="gps.csv", mime="text/csv")
-        st.markdown("### Eliminar sesiones de SESIÓN GPS")
-        gps_sessions = gps_df[["Fecha","Microciclo"]].drop_duplicates().sort_values(["Fecha","Microciclo"])
-        gps_labels = [f"{pd.to_datetime(r.Fecha).strftime('%Y-%m-%d')} | {r.Microciclo}" for _, r in gps_sessions.iterrows()]
-        if gps_labels:
-            sel = st.selectbox("Selecciona la sesión GPS a eliminar", gps_labels)
-            if st.button("Eliminar sesión GPS", type="secondary"):
+
+        st.markdown("### Eliminar sesiones de SESIÓN GPS del microciclo")
+        gps_micro = gps_df[gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy()
+        if not gps_micro.empty:
+            gps_sessions = gps_micro[["Fecha","Microciclo"]].drop_duplicates().sort_values(["Fecha","Microciclo"])
+            gps_labels = [f"{pd.to_datetime(r.Fecha).strftime('%Y-%m-%d')} | {r.Microciclo}" for _, r in gps_sessions.iterrows()]
+            sel = st.selectbox("Selecciona la sesión GPS del microciclo a eliminar", gps_labels)
+            if st.button("Eliminar sesión GPS microciclo", type="secondary"):
                 date_str, micro = [x.strip() for x in sel.split("|", 1)]
                 delete_gps_session(date_str, micro)
                 st.success(f"Sesión GPS {sel} eliminada correctamente.")
+                st.rerun()
+
+        st.markdown("### Eliminar PARTIDOS")
+        gps_matches = gps_df[gps_df["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy()
+        if not gps_matches.empty:
+            match_labels = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in sorted(gps_matches["Fecha"].dropna().unique())]
+            sel_match = st.selectbox("Selecciona el partido a eliminar", match_labels)
+            if st.button("Eliminar partido", type="secondary"):
+                delete_gps_match(sel_match)
+                st.success(f"Partido {sel_match} eliminado correctamente.")
                 st.rerun()
 
 def main():
