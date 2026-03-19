@@ -128,6 +128,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS monitoring (
             Fecha TEXT NOT NULL,
             Jugador TEXT NOT NULL,
+            Microciclo TEXT,
             Posicion TEXT,
             Minutos REAL,
             CMJ REAL,
@@ -139,6 +140,10 @@ def init_db():
             PRIMARY KEY (Fecha, Jugador)
         )
     """)
+    try:
+        cur.execute("ALTER TABLE monitoring ADD COLUMN Microciclo TEXT")
+    except Exception:
+        pass
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gps_data (
             Fecha TEXT NOT NULL,
@@ -164,13 +169,23 @@ def load_monitoring():
     df = pd.read_sql("SELECT * FROM monitoring", conn)
     conn.close()
     if df.empty:
-        return pd.DataFrame(columns=["Fecha","Jugador","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"])
+        return pd.DataFrame(columns=["Fecha","Jugador","Microciclo","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"])
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    if "Microciclo" not in df.columns:
+        df["Microciclo"] = np.nan
     for c in ["Minutos", *ALL_METRICS]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df["Jugador"] = df["Jugador"].astype(str).str.strip()
     return df.sort_values(["Jugador","Fecha"]).reset_index(drop=True)
+
+def ensure_gps_datetime(df):
+    if df is None:
+        return pd.DataFrame()
+    df = df.copy()
+    if "Fecha" in df.columns:
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    return df
 
 def upsert_monitoring(df):
     if df.empty:
@@ -181,6 +196,7 @@ def upsert_monitoring(df):
         rows.append((
             str(pd.to_datetime(r["Fecha"]).date()),
             str(r["Jugador"]),
+            None if pd.isna(r.get("Microciclo")) else str(r.get("Microciclo")),
             None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
             None if pd.isna(r.get("Minutos")) else float(r.get("Minutos")),
             None if pd.isna(r.get("CMJ")) else float(r.get("CMJ")),
@@ -194,9 +210,10 @@ def upsert_monitoring(df):
     cur = conn.cursor()
     cur.executemany("""
         INSERT INTO monitoring
-        (Fecha, Jugador, Posicion, Minutos, CMJ, RSI_mod, VMP, sRPE, Observaciones, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (Fecha, Jugador, Microciclo, Posicion, Minutos, CMJ, RSI_mod, VMP, sRPE, Observaciones, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Fecha, Jugador) DO UPDATE SET
+            Microciclo=excluded.Microciclo,
             Posicion=excluded.Posicion,
             Minutos=excluded.Minutos,
             CMJ=excluded.CMJ,
@@ -501,6 +518,16 @@ def upsert_gps(df):
     conn.commit()
     conn.close()
 
+def delete_fatigue_session(date_str, micro=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    if micro is None or micro == "" or str(micro).lower() == "nan":
+        cur.execute("DELETE FROM monitoring WHERE Fecha = ?", (date_str,))
+    else:
+        cur.execute("DELETE FROM monitoring WHERE Fecha = ? AND (Microciclo = ? OR Microciclo IS NULL)", (date_str, micro))
+    conn.commit()
+    conn.close()
+
 def delete_gps_session(date_str, micro):
     conn = get_conn()
     cur = conn.cursor()
@@ -541,6 +568,7 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
     return out.drop_duplicates(subset=["Fecha","Microciclo","Jugador"], keep="last")
 
 def build_match_profile(gps_df):
+    gps_df = ensure_gps_datetime(gps_df)
     if gps_df.empty:
         return pd.DataFrame(columns=["Jugador", *[f"{m}_match" for m in GPS_METRICS]])
     match_df = gps_df[gps_df["Microciclo"].str.upper() == "PARTIDO"].copy()
@@ -559,6 +587,7 @@ def gps_status_from_pct(pct, min_v, max_v):
     return ("Alto", "#DC2626") if pct > (max_v + 15) else ("Alto", "#F59E0B")
 
 def gps_compute_compliance(gps_df):
+    gps_df = ensure_gps_datetime(gps_df)
     if gps_df.empty:
         return gps_df.copy()
     prof = build_match_profile(gps_df)
@@ -579,6 +608,7 @@ def gps_compute_compliance(gps_df):
     return df
 
 def gps_player_week_table(gps_df, player, any_date):
+    gps_df = ensure_gps_datetime(gps_df)
     if gps_df.empty:
         return pd.DataFrame()
     any_date = pd.to_datetime(any_date)
@@ -604,6 +634,7 @@ def gps_player_week_table(gps_df, player, any_date):
     return out
 
 def gps_player_session_table(gps_df, player, date_value, micro=None):
+    gps_df = ensure_gps_datetime(gps_df)
     if gps_df.empty:
         return pd.DataFrame()
     date_value = pd.to_datetime(date_value).normalize()
@@ -657,18 +688,9 @@ def gps_progress_bars_streamlit(df, title):
         )
 
 def gps_player_report_html(player, gps_df, selected_date):
+    gps_df = ensure_gps_datetime(gps_df)
     week_df = gps_player_week_table(gps_df, player, selected_date)
     sess_df = gps_player_session_table(gps_df, player, selected_date)
-    gps_html = ""
-    if gps_df is not None and not gps_df.empty:
-        gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.strftime("%Y-%m-%d") == str(selected_date)].copy())
-        if not gps_day.empty:
-            gps_rows = ""
-            for _, rg in gps_day.iterrows():
-                gps_rows += f"<tr><td>{rg['Jugador']}</td><td>{rg['Microciclo']}</td><td>{rg.get('hsr_pct_match', np.nan):.1f}%</td><td>{rg.get('sprints_pct_match', np.nan):.1f}%</td><td>{rg.get('distance_vrange6_pct_match', np.nan):.1f}%</td><td>{rg.get('num_acc_pct_match', np.nan):.1f}%</td><td>{rg.get('num_dec_pct_match', np.nan):.1f}%</td></tr>"
-            gps_html = f"<div class='section'><div class='title'>GPS de la sesión</div><table class='report-table'><thead><tr><th>Jugador</th><th>Día</th><th>HSR %</th><th>Sprint %</th><th>Dist sprint %</th><th>ACC %</th><th>DEC %</th></tr></thead><tbody>{gps_rows}</tbody></table></div>"
-    gps_html = gps_player_report_html(row["Jugador"], gps_df, row["Fecha"]) if gps_df is not None else ""
-    gps_html = gps_player_report_html(player, gps_df, latest["Fecha"]) if gps_df is not None else ""
     return f"""
     <div class='section'><div class='title'>Carga GPS de la sesión</div>{gps_progress_bars_html(sess_df, 'Cumplimiento del día')}</div>
     <div class='section'><div class='title'>Carga GPS semanal</div>{gps_progress_bars_html(week_df, 'Acumulado semanal')}</div>
@@ -1654,6 +1676,7 @@ def build_pdf_bytes_player_season(player_df, player, gps_df=None):
     return buf.getvalue()
 
 def build_pdf_bytes_team_session(team_day, selected_date, gps_df=None):
+    gps_df = ensure_gps_datetime(gps_df)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=1.0*cm, rightMargin=1.0*cm, topMargin=1.0*cm, bottomMargin=1.0*cm)
     styles = report_styles()
@@ -1671,7 +1694,7 @@ def build_pdf_bytes_team_session(team_day, selected_date, gps_df=None):
             elems.append(rl_img)
             elems.append(Spacer(1, 0.15*cm))
     if gps_df is not None:
-        gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.strftime("%Y-%m-%d") == str(selected_date)].copy())
+        gps_day = gps_compute_compliance(ensure_gps_datetime(gps_df)[ensure_gps_datetime(gps_df)["Fecha"].dt.strftime("%Y-%m-%d") == str(selected_date)].copy())
         if not gps_day.empty:
             elems.append(Paragraph("GPS de la sesión", styles["SectionDark"]))
             gdata = [["Jugador","Día","HSR %","Sprint %","Dist sprint %","ACC %","DEC %"]]
@@ -1699,12 +1722,17 @@ def page_cargar():
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### CONTROL DE FATIGA")
+        fat_fecha = st.date_input("Fecha control de fatiga", value=pd.Timestamp.today(), key="fat_fecha")
+        fat_micro = st.selectbox("Día microciclo fatiga", ["MD+1","MD-4","MD-3","MD-2","MD-1","PARTIDO"], index=4, key="fat_micro")
         uploaded = st.file_uploader("Sube Excel/CSV de fatiga", type=["xlsx","xls","csv"], key="fatigue_upload")
         if uploaded is not None:
             try:
                 parsed = parse_uploaded(uploaded)
+                parsed["Fecha"] = pd.to_datetime(fat_fecha)
+                parsed["Microciclo"] = fat_micro
                 st.success(f"Archivo interpretado correctamente: {parsed['Jugador'].nunique()} jugadores · {parsed['Fecha'].nunique()} fecha(s)")
-                st.dataframe(parsed, use_container_width=True, hide_index=True)
+                cols_show = [c for c in ["Fecha","Microciclo","Jugador","Posicion","CMJ","RSI_mod","VMP","sRPE","Observaciones"] if c in parsed.columns]
+                st.dataframe(parsed[cols_show], use_container_width=True, hide_index=True)
                 if st.button("Guardar control de fatiga", type="primary"):
                     upsert_monitoring(parsed)
                     st.success("Datos de fatiga guardados correctamente.")
@@ -1743,7 +1771,7 @@ def page_equipo(metrics_df, gps_df):
     opts = sorted(set(date_candidates))
     selected_date = pd.to_datetime(st.selectbox("Fecha de análisis", opts, index=len(opts)-1))
     team_day = metrics_df[metrics_df["Fecha"].dt.normalize() == selected_date.normalize()].copy() if not metrics_df.empty else pd.DataFrame()
-    gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.normalize() == selected_date.normalize()].copy()) if not gps_df.empty else pd.DataFrame()
+    gps_day = gps_compute_compliance(ensure_gps_datetime(gps_df)[ensure_gps_datetime(gps_df)["Fecha"].dt.normalize() == selected_date.normalize()].copy()) if not gps_df.empty else pd.DataFrame()
 
     c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
     with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), f"{team_day['Jugador'].nunique() if not team_day.empty else gps_day['Jugador'].nunique()} jugadores")
@@ -1875,6 +1903,7 @@ def page_comparador(metrics_df):
     st.plotly_chart(fig, use_container_width=True)
 
 def page_informes(metrics_df, gps_df):
+    gps_df = ensure_gps_datetime(gps_df)
     if metrics_df.empty and gps_df.empty:
         st.info("No hay datos disponibles.")
         return
@@ -1948,33 +1977,44 @@ def page_admin(base_df, gps_df):
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi("Registros fatiga", len(base_df), "total")
     with c2: kpi("Jugadores fatiga", base_df["Jugador"].nunique() if not base_df.empty else 0, "únicos")
-    with c3: kpi("Sesiones GPS", len(gps_df[["Fecha","Microciclo"]].drop_duplicates()) if not gps_df.empty else 0, "guardadas")
+    with c3: kpi("Sesiones GPS", len(ensure_gps_datetime(gps_df)[["Fecha","Microciclo"]].drop_duplicates()) if not gps_df.empty else 0, "guardadas")
     with c4: kpi("Jugadores GPS", gps_df["Jugador"].nunique() if not gps_df.empty else 0, "únicos")
+
     if not base_df.empty:
         st.download_button("Descargar base fatiga CSV", data=base_df.to_csv(index=False).encode("utf-8"), file_name="fatiga.csv", mime="text/csv")
-        st.markdown("### Eliminar una sesión de fatiga")
-        date_opts = sorted(base_df["Fecha"].dropna().dt.strftime("%Y-%m-%d").unique().tolist())
-        if date_opts:
-            selected_delete = st.selectbox("Selecciona la fecha de fatiga a eliminar", date_opts)
+        st.markdown("### Eliminar sesiones de CONTROL DE FATIGA")
+        fat_df = base_df.copy()
+        fat_df["Fecha"] = pd.to_datetime(fat_df["Fecha"], errors="coerce")
+        if "Microciclo" not in fat_df.columns:
+            fat_df["Microciclo"] = np.nan
+        fat_sessions = fat_df[["Fecha","Microciclo"]].drop_duplicates().sort_values(["Fecha","Microciclo"], na_position="last")
+        fat_labels = []
+        for _, r in fat_sessions.iterrows():
+            d = pd.to_datetime(r["Fecha"]).strftime("%Y-%m-%d") if pd.notna(r["Fecha"]) else "Sin fecha"
+            micro = "" if pd.isna(r["Microciclo"]) else str(r["Microciclo"])
+            fat_labels.append(f"{d} | {micro if micro else 'Sin día'}")
+        if fat_labels:
+            fat_sel = st.selectbox("Selecciona la sesión de fatiga a eliminar", fat_labels)
             if st.button("Eliminar sesión de fatiga", type="secondary"):
-                delete_session_by_date(selected_delete)
-                st.success(f"Sesión {selected_delete} eliminada correctamente.")
+                date_str, micro = [x.strip() for x in fat_sel.split("|", 1)]
+                delete_fatigue_session(date_str, None if micro == "Sin día" else micro)
+                st.success(f"Sesión de fatiga {fat_sel} eliminada correctamente.")
                 st.rerun()
+
     if not gps_df.empty:
+        gps_df = ensure_gps_datetime(gps_df)
         st.download_button("Descargar base GPS CSV", data=gps_df.to_csv(index=False).encode("utf-8"), file_name="gps.csv", mime="text/csv")
-        st.markdown("### Eliminar una sesión GPS")
+        st.markdown("### Eliminar sesiones de SESIÓN GPS")
         gps_sessions = gps_df[["Fecha","Microciclo"]].drop_duplicates().sort_values(["Fecha","Microciclo"])
         gps_labels = [f"{pd.to_datetime(r.Fecha).strftime('%Y-%m-%d')} | {r.Microciclo}" for _, r in gps_sessions.iterrows()]
-        sel = st.selectbox("Selecciona la sesión GPS a eliminar", gps_labels)
-        if st.button("Eliminar sesión GPS", type="secondary"):
-            date_str, micro = [x.strip() for x in sel.split("|")]
-            delete_gps_session(date_str, micro)
-            st.success("Sesión GPS eliminada correctamente.")
-            st.rerun()
+        if gps_labels:
+            sel = st.selectbox("Selecciona la sesión GPS a eliminar", gps_labels)
+            if st.button("Eliminar sesión GPS", type="secondary"):
+                date_str, micro = [x.strip() for x in sel.split("|", 1)]
+                delete_gps_session(date_str, micro)
+                st.success(f"Sesión GPS {sel} eliminada correctamente.")
+                st.rerun()
 
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     init_db()
     st.sidebar.markdown("## Filtros")
