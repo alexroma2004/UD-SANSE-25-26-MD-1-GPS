@@ -787,7 +787,28 @@ def delete_gps_session(date_str, micro):
     conn.commit()
     conn.close()
 
+
+
+def find_col_alias(cols_map, aliases, required=True):
+    for a in aliases:
+        key = str(a).lower().strip()
+        if key in cols_map:
+            return cols_map[key]
+    if required:
+        raise ValueError(f"No se encontró ninguna de estas columnas: {aliases}")
+    return None
+
 def parse_gps_uploaded(uploaded_file, fecha, microciclo):
+    local_find_col_alias = globals().get("find_col_alias")
+    if local_find_col_alias is None:
+        def local_find_col_alias(cols_map, aliases, required=True):
+            for a in aliases:
+                key = str(a).lower().strip()
+                if key in cols_map:
+                    return cols_map[key]
+            if required:
+                raise ValueError(f"No se encontró ninguna de estas columnas: {aliases}")
+            return None
     name = uploaded_file.name.lower()
     sep = ";" if name.endswith(".csv") else None
     if name.endswith(".csv"):
@@ -796,13 +817,13 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
         df = pd.read_excel(uploaded_file)
 
     cols = {str(c).lower().strip(): c for c in df.columns}
-    player_col = find_col_alias(cols, ["player","jugador","name","nombre"])
-    total_distance_col = find_col_alias(cols, ["total_distance","distance","distancia total","dist_total"], required=False)
-    hsr_col = find_col_alias(cols, ["hsr","high speed running"])
-    sprints_col = find_col_alias(cols, ["sprints","num_sprints","nº sprints"])
-    sprint_dist_col = find_col_alias(cols, ["distance_vrange6","sprint_distance","distancia sprint"])
-    acc_col = find_col_alias(cols, ["num_acc","acc","accelerations","aceleraciones"])
-    dec_col = find_col_alias(cols, ["num_dec","dec","decelerations","deceleraciones"])
+    player_col = local_find_col_alias(cols, ["player","jugador","name","nombre"])
+    total_distance_col = local_find_col_alias(cols, ["total_distance","distance","distancia total","dist_total"], required=False)
+    hsr_col = local_find_col_alias(cols, ["hsr","high speed running"])
+    sprints_col = local_find_col_alias(cols, ["sprints","num_sprints","nº sprints"])
+    sprint_dist_col = local_find_col_alias(cols, ["distance_vrange6","sprint_distance","distancia sprint"])
+    acc_col = local_find_col_alias(cols, ["num_acc","acc","accelerations","aceleraciones"])
+    dec_col = local_find_col_alias(cols, ["num_dec","dec","decelerations","deceleraciones"])
 
     out = pd.DataFrame({
         "Fecha": pd.to_datetime(fecha),
