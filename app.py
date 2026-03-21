@@ -2126,11 +2126,58 @@ def page_equipo(metrics_df, gps_df):
 
     if not gps_day.empty:
         st.markdown("### GPS del día")
-        gps_show = gps_day[["Jugador","Posicion","Microciclo","compliance_score","session_status","hsr_pct","sprints_pct","distance_vrange6_pct","num_acc_pct","num_dec_pct"]].copy()
-        gps_show.columns = ["Jugador","Posición","Día","Cumplimiento %","Estado","HSR %","Sprints %","Distancia sprint %","ACC %","DEC %"]
-        for c in ["Cumplimiento %","HSR %","Sprints %","Distancia sprint %","ACC %","DEC %"]:
-            gps_show[c] = gps_show[c].round(1)
-        st.dataframe(gps_show.sort_values(["Cumplimiento %"], ascending=False), use_container_width=True, hide_index=True)
+        gps_day = gps_day.copy()
+
+        # Compatibilidad con distintas versiones del cálculo GPS
+        rename_candidates = {
+            "hsr_pct_match": "hsr_pct",
+            "sprints_pct_match": "sprints_pct",
+            "distance_vrange6_pct_match": "distance_vrange6_pct",
+            "num_acc_pct_match": "num_acc_pct",
+            "num_dec_pct_match": "num_dec_pct",
+        }
+        for src_col, dst_col in rename_candidates.items():
+            if dst_col not in gps_day.columns and src_col in gps_day.columns:
+                gps_day[dst_col] = gps_day[src_col]
+
+        if "session_status" not in gps_day.columns:
+            status_cols = [f"{m}_status" for m in ["hsr", "sprints", "distance_vrange6", "num_acc", "num_dec"] if f"{m}_status" in gps_day.columns]
+            if status_cols:
+                def _session_status(row):
+                    vals = [str(row[c]) for c in status_cols if c in row.index and pd.notna(row[c])]
+                    if any(v == "Alto" for v in vals):
+                        return "Alto"
+                    if any(v == "Bajo" for v in vals):
+                        return "Bajo"
+                    if any(v == "Adecuado" for v in vals):
+                        return "Adecuado"
+                    return "Sin objetivo"
+                gps_day["session_status"] = gps_day.apply(_session_status, axis=1)
+            else:
+                gps_day["session_status"] = "Sin objetivo"
+
+        required_cols = {
+            "Jugador": "Jugador",
+            "Posicion": "Posición",
+            "Microciclo": "Día",
+            "compliance_score": "Cumplimiento %",
+            "session_status": "Estado",
+            "hsr_pct": "HSR %",
+            "sprints_pct": "Sprints %",
+            "distance_vrange6_pct": "Distancia sprint %",
+            "num_acc_pct": "ACC %",
+            "num_dec_pct": "DEC %",
+        }
+
+        for col in required_cols:
+            if col not in gps_day.columns:
+                gps_day[col] = np.nan if col != "session_status" else "Sin objetivo"
+
+        gps_show = gps_day[list(required_cols.keys())].copy()
+        gps_show.columns = list(required_cols.values())
+        for c in ["Cumplimiento %", "HSR %", "Sprints %", "Distancia sprint %", "ACC %", "DEC %"]:
+            gps_show[c] = pd.to_numeric(gps_show[c], errors="coerce").round(1)
+        st.dataframe(gps_show.sort_values(["Cumplimiento %"], ascending=False, na_position="last"), use_container_width=True, hide_index=True)
 
 
 def page_jugador(metrics_df, gps_df):
