@@ -176,13 +176,22 @@ def load_monitoring():
     for c in ["Minutos", *ALL_METRICS]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["Jugador"] = df["Jugador"].astype(str).str.strip()
+    df["Jugador"] = df["Jugador"].astype(str).map(normalize_player_name)
     return df.sort_values(["Jugador","Fecha"]).reset_index(drop=True)
+
+
+def standardize_player_names_in_frames(df):
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    if "Jugador" in df.columns:
+        df["Jugador"] = df["Jugador"].map(normalize_player_name)
+    return df
 
 def ensure_gps_datetime(df):
     if df is None:
         return pd.DataFrame()
-    df = df.copy()
+    df = standardize_player_names_in_frames(df)
     if "Fecha" in df.columns:
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     return df
@@ -446,7 +455,7 @@ def upsert_monitoring(df):
     for _, r in df.iterrows():
         rows.append((
             str(pd.to_datetime(r["Fecha"]).date()),
-            str(r["Jugador"]),
+            str(normalize_player_name(r["Jugador"])),
             None if pd.isna(r.get("Microciclo")) else str(r.get("Microciclo")),
             None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
             None if pd.isna(r.get("Minutos")) else float(r.get("Minutos")),
@@ -586,7 +595,7 @@ def parse_tidy(df_raw):
 
     df = df[["Fecha","Jugador","Microciclo","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"]].copy()
     df["Fecha"] = pd.to_datetime(df["Fecha"], dayfirst=True, errors="coerce")
-    df["Jugador"] = df["Jugador"].apply(std_name)
+    df["Jugador"] = df["Jugador"].apply(normalize_player_name)
     for c in ["Minutos", *ALL_METRICS]:
         df[c] = df[c].apply(safe_num)
     return df.dropna(subset=["Fecha","Jugador"]).drop_duplicates(subset=["Fecha","Jugador"], keep="last")
@@ -613,7 +622,7 @@ def parse_block(df_raw):
             var4 = str(df.iat[i+3, 1]).strip().lower() if pd.notna(df.iat[i+3, 1]) else ""
             looks_like_group = pd.notna(player) and "cmj" in var1 and "rsi" in var2 and "vmp" in var3 and ("rpe" in var4 or "srpe" in var4 or "s-rpe" in var4)
             if looks_like_group:
-                player_name = std_name(player)
+                player_name = normalize_player_name(player)
                 for c, d in date_cols:
                     cmj = safe_num(df.iat[i, c]) if c < df.shape[1] else np.nan
                     rsi = safe_num(df.iat[i+1, c]) if c < df.shape[1] else np.nan
@@ -643,7 +652,7 @@ def parse_block(df_raw):
             first = tokens[0]
             if first.lower() not in ["cmj","rsi mod","rsi_mod","vmp","srpe","s-rpe","rpe"]:
                 if try_parse_date(first) is None and pd.isna(safe_num(first)):
-                    current_player = std_name(first)
+                    current_player = normalize_player_name(first)
 
         if current_player is not None and current_date is not None and i + 3 < len(df):
             labels = []; nums = []
@@ -739,7 +748,7 @@ def upsert_gps(df):
         rows.append((
             str(pd.to_datetime(r["Fecha"]).date()),
             str(r["Microciclo"]),
-            str(r["Jugador"]),
+            str(normalize_player_name(r["Jugador"])),
             None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
             None if pd.isna(r.get("total_distance")) else float(r.get("total_distance")),
             None if pd.isna(r.get("hsr")) else float(r.get("hsr")),
@@ -2368,8 +2377,8 @@ def main():
     st.sidebar.markdown("## Filtros")
     st.sidebar.markdown("### Umbrales integrados")
     st.sidebar.caption("La lógica integrada usa tolerancias fijas para GPS y fatiga en esta versión.")
-    base_df = load_monitoring()
-    gps_df = load_gps()
+    base_df = standardize_player_names_in_frames(load_monitoring())
+    gps_df = standardize_player_names_in_frames(load_gps())
     pos_opts = []
     if not base_df.empty and "Posicion" in base_df.columns and base_df["Posicion"].notna().any():
         pos_opts += [x for x in base_df["Posicion"].dropna().astype(str).unique().tolist() if x.strip() != ""]
