@@ -251,6 +251,193 @@ def integrated_week_text(metrics_df, gps_df, selected_date):
         f"Casos moderados o peores acumulados: {fat['moderate_or_worse']}. Críticos: {fat['critical']}."
     )
 
+
+
+def integrated_load_response_label(gps_day_compliance, gps_week_compliance, readiness, loss):
+    if pd.notna(gps_week_compliance) and gps_week_compliance >= 85 and pd.notna(readiness) and readiness >= 70:
+        return "Buena tolerancia"
+    if pd.notna(gps_week_compliance) and gps_week_compliance < 60 and pd.notna(readiness) and readiness >= 75:
+        return "Infraestimulación probable"
+    if pd.notna(gps_week_compliance) and gps_week_compliance >= 85 and pd.notna(readiness) and readiness < 60:
+        return "Carga alta con mala respuesta"
+    if pd.notna(gps_week_compliance) and gps_week_compliance < 60 and pd.notna(readiness) and readiness < 60:
+        return "Fatiga no explicada por la carga"
+    if pd.notna(loss) and loss >= 1.5 and pd.notna(gps_day_compliance) and gps_day_compliance < 60:
+        return "Fatiga con estímulo insuficiente"
+    return "Relación carga-respuesta estable"
+
+def integrated_decision_from_components(fatigue_risk, base_decision, gps_day_compliance, gps_week_compliance, readiness, weekly_alerts=0):
+    severity = 0
+    mapping = {
+        "Disponible normal": 0,
+        "Disponible con control": 1,
+        "Controlar carga": 1,
+        "Ajustar carga": 2,
+        "Reducir exposición": 3,
+        "Intervención individual": 4,
+    }
+    severity = max(severity, mapping.get(base_decision, 0))
+    if fatigue_risk in ["Fatiga moderada", "Fatiga moderada-alta"]:
+        severity = max(severity, 2)
+    if fatigue_risk == "Fatiga crítica":
+        severity = max(severity, 4)
+    if pd.notna(gps_day_compliance):
+        if gps_day_compliance < 50 or gps_day_compliance > 115:
+            severity = max(severity, 2)
+        elif gps_day_compliance < 65 or gps_day_compliance > 105:
+            severity = max(severity, 1)
+    if pd.notna(gps_week_compliance):
+        if gps_week_compliance < 60 or gps_week_compliance > 115:
+            severity = max(severity, 2)
+        elif gps_week_compliance < 75 or gps_week_compliance > 105:
+            severity = max(severity, 1)
+    if pd.notna(readiness) and readiness < 45:
+        severity = max(severity, 4)
+    elif pd.notna(readiness) and readiness < 60:
+        severity = max(severity, 2)
+    if weekly_alerts >= 2:
+        severity = max(severity, min(4, severity + 1))
+    inv = {
+        0: ("Disponible normal","🟢"),
+        1: ("Disponible con control","🟡"),
+        2: ("Ajustar carga","🟠"),
+        3: ("Reducir exposición","🟠"),
+        4: ("Intervención individual","🔴"),
+    }
+    return inv.get(severity, ("Disponible normal","🟢"))
+
+def compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df):
+    selected_date = pd.to_datetime(selected_date)
+    ws = week_start(selected_date)
+    we = ws + pd.Timedelta(days=6)
+    out = {
+        "gps_day_compliance": np.nan,
+        "gps_week_compliance": np.nan,
+        "gps_day_status": "Sin GPS",
+        "gps_week_status": "Sin GPS",
+        "fat_week_readiness": np.nan,
+        "fat_week_loss": np.nan,
+        "fat_week_sessions": 0,
+        "weekly_alerts": 0,
+        "days_since_match": np.nan,
+        "load_response_label": "Sin información",
+        "integrated_decision": "Sin datos",
+        "integrated_icon": "⚪",
+        "context_label": "Sin contexto competitivo",
+    }
+
+    if gps_df is not None and not gps_df.empty:
+        gps_df = ensure_gps_datetime(gps_df)
+        p_gps = gps_compute_compliance(gps_df[gps_df["Jugador"] == player].copy())
+        day = p_gps[p_gps["Fecha"].dt.normalize() == selected_date.normalize()].copy()
+        if not day.empty and "compliance_score" in day.columns:
+            out["gps_day_compliance"] = float(day["compliance_score"].mean())
+            out["gps_day_status"] = "Adecuado" if 85 <= out["gps_day_compliance"] <= 100 else ("Desviado" if 70 <= out["gps_day_compliance"] <= 115 else "Muy desviado")
+        week = p_gps[(p_gps["Fecha"] >= ws) & (p_gps["Fecha"] <= we) & (p_gps["Microciclo"].astype(str).str.upper() != "PARTIDO")].copy()
+        if not week.empty and "compliance_score" in week.columns:
+            out["gps_week_compliance"] = float(week["compliance_score"].mean())
+            out["gps_week_status"] = "Adecuado" if 85 <= out["gps_week_compliance"] <= 100 else ("Desviado" if 70 <= out["gps_week_compliance"] <= 115 else "Muy desviado")
+            out["weekly_alerts"] += int(((week["compliance_score"] < 70) | (week["compliance_score"] > 115)).sum())
+        matches = p_gps[p_gps["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy()
+        prev_matches = matches[matches["Fecha"] <= selected_date].sort_values("Fecha")
+        if not prev_matches.empty:
+            last_match = prev_matches.iloc[-1]["Fecha"]
+            out["days_since_match"] = int((selected_date.normalize() - pd.to_datetime(last_match).normalize()).days)
+            out["context_label"] = f"{out['days_since_match']} días desde el último partido"
+
+    if metrics_df is not None and not metrics_df.empty:
+        p_fat = metrics_df[metrics_df["Jugador"] == player].copy()
+        p_fat["Fecha"] = pd.to_datetime(p_fat["Fecha"], errors="coerce")
+        week_fat = p_fat[(p_fat["Fecha"] >= ws) & (p_fat["Fecha"] <= we)].copy()
+        if not week_fat.empty:
+            out["fat_week_readiness"] = float(week_fat["readiness_score"].mean())
+            out["fat_week_loss"] = float(week_fat["objective_loss_score"].mean())
+            out["fat_week_sessions"] = int(week_fat[["Fecha","Microciclo"]].drop_duplicates().shape[0])
+            out["weekly_alerts"] += int(week_fat["risk_label"].isin(["Fatiga moderada","Fatiga moderada-alta","Fatiga crítica"]).sum())
+        day_fat = p_fat[p_fat["Fecha"].dt.normalize() == selected_date.normalize()].copy()
+        if not day_fat.empty:
+            r = day_fat.iloc[-1]
+            dec, icon = integrated_decision_from_components(
+                r.get("risk_label","Buen estado"),
+                r.get("decision_label","Disponible normal"),
+                out["gps_day_compliance"],
+                out["gps_week_compliance"],
+                r.get("readiness_score", np.nan),
+                out["weekly_alerts"],
+            )
+            out["integrated_decision"] = dec
+            out["integrated_icon"] = icon
+            out["load_response_label"] = integrated_load_response_label(out["gps_day_compliance"], out["gps_week_compliance"], r.get("readiness_score", np.nan), r.get("objective_loss_score", np.nan))
+        elif pd.notna(out["fat_week_readiness"]):
+            dec, icon = integrated_decision_from_components(
+                "Buen estado", "Disponible normal", out["gps_day_compliance"], out["gps_week_compliance"], out["fat_week_readiness"], out["weekly_alerts"]
+            )
+            out["integrated_decision"] = dec
+            out["integrated_icon"] = icon
+            out["load_response_label"] = integrated_load_response_label(out["gps_day_compliance"], out["gps_week_compliance"], out["fat_week_readiness"], out["fat_week_loss"])
+    return out
+
+def integrated_alerts_for_player(player, selected_date, metrics_df, gps_df):
+    snap = compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df)
+    alerts = []
+    if pd.notna(snap["gps_day_compliance"]) and (snap["gps_day_compliance"] < 70 or snap["gps_day_compliance"] > 115):
+        alerts.append("Cumplimiento GPS diario fuera de rango")
+    if pd.notna(snap["gps_week_compliance"]) and (snap["gps_week_compliance"] < 75 or snap["gps_week_compliance"] > 110):
+        alerts.append("Cumplimiento GPS semanal fuera de rango")
+    if pd.notna(snap["fat_week_readiness"]) and snap["fat_week_readiness"] < 60:
+        alerts.append("Readiness semanal bajo")
+    if snap["weekly_alerts"] >= 3:
+        alerts.append("Persistencia alta de alertas en la semana")
+    if snap["load_response_label"] in ["Carga alta con mala respuesta","Fatiga no explicada por la carga","Fatiga con estímulo insuficiente"]:
+        alerts.append(snap["load_response_label"])
+    return alerts
+
+def plot_player_integrated_week_dashboard(player, selected_date, metrics_df, gps_df):
+    snap = compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df)
+    labels = ["GPS día","GPS semana","Readiness semana","Loss semana inv."]
+    vals = [
+        0 if pd.isna(snap["gps_day_compliance"]) else snap["gps_day_compliance"],
+        0 if pd.isna(snap["gps_week_compliance"]) else snap["gps_week_compliance"],
+        0 if pd.isna(snap["fat_week_readiness"]) else snap["fat_week_readiness"],
+        0 if pd.isna(snap["fat_week_loss"]) else max(0, 100 - snap["fat_week_loss"] / 3 * 100),
+    ]
+    fig = go.Figure(go.Bar(x=vals, y=labels, orientation="h", text=[f"{v:.1f}" for v in vals]))
+    fig.update_traces(textposition="outside")
+    fig.update_layout(title="Dashboard semanal integrado", height=320, margin=dict(l=20,r=20,t=60,b=20))
+    fig.update_xaxes(range=[0, 120], title="Índice / %")
+    return fig
+
+def plot_integrated_team_matrix(team_day, metrics_df, gps_df, selected_date):
+    if team_day.empty:
+        return go.Figure()
+    rows = []
+    for _, r in team_day.iterrows():
+        snap = compute_integrated_player_snapshot(r["Jugador"], selected_date, metrics_df, gps_df)
+        rows.append({
+            "Jugador": r["Jugador"],
+            "Loss": r.get("objective_loss_score", np.nan),
+            "GPS semana": snap["gps_week_compliance"],
+            "Decisión integrada": snap["integrated_decision"],
+        })
+    temp = pd.DataFrame(rows)
+    fig = px.scatter(
+        temp, x="GPS semana", y="Loss", text="Jugador", color="Decisión integrada",
+        title="Matriz integrada: cumplimiento GPS semanal vs fatiga"
+    )
+    fig.update_traces(textposition="top center")
+    fig.update_layout(height=420, margin=dict(l=20,r=20,t=60,b=20))
+    return fig
+
+def player_distribution_summary(player_df):
+    if player_df is None or player_df.empty:
+        return {}
+    counts = player_df["risk_label"].value_counts()
+    total = max(1, len(player_df))
+    return {k: round(counts.get(k, 0) / total * 100, 1) for k in RISK_ORDER}
+
+def latest_context_summary(player, selected_date, gps_df):
+    snap = compute_integrated_player_snapshot(player, selected_date, pd.DataFrame(), gps_df)
+    return snap["context_label"]
 def upsert_monitoring(df):
     if df.empty:
         return
@@ -377,7 +564,8 @@ def parse_tidy(df_raw):
     for c in df.columns:
         low = c.lower().strip()
         if low in ["fecha","date"]: rename[c] = "Fecha"
-        elif low in ["jugador","player","nombre"]: rename[c] = "Jugador"
+        elif low in ["microciclo","dia","día","md","day"]: rename[c] = "Microciclo"
+        elif low in ["jugador","player","nombre","name"]: rename[c] = "Jugador"
         elif "pos" in low: rename[c] = "Posicion"
         elif "min" in low: rename[c] = "Minutos"
         elif "cmj" in low: rename[c] = "CMJ"
@@ -392,11 +580,11 @@ def parse_tidy(df_raw):
     if missing:
         raise ValueError(f"Faltan columnas: {missing}")
 
-    for optional in ["Posicion","Minutos","Observaciones","sRPE"]:
+    for optional in ["Microciclo","Posicion","Minutos","Observaciones","sRPE"]:
         if optional not in df.columns:
             df[optional] = np.nan
 
-    df = df[["Fecha","Jugador","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"]].copy()
+    df = df[["Fecha","Jugador","Microciclo","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"]].copy()
     df["Fecha"] = pd.to_datetime(df["Fecha"], dayfirst=True, errors="coerce")
     df["Jugador"] = df["Jugador"].apply(std_name)
     for c in ["Minutos", *ALL_METRICS]:
@@ -606,29 +794,30 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
         df = pd.read_csv(uploaded_file, sep=sep, engine="python", encoding="utf-8-sig", on_bad_lines="skip")
     else:
         df = pd.read_excel(uploaded_file)
-    cols = {c.lower().strip(): c for c in df.columns}
-    required = ["player","hsr","sprints","distance_vrange6","num_acc","num_dec"]
-    missing = [c for c in required if c not in cols]
-    if missing:
-        raise ValueError(f"Faltan columnas GPS: {missing}")
-    if "total_distance" not in cols:
-        raise ValueError("Falta la columna total_distance en el archivo GPS.")
+
+    cols = {str(c).lower().strip(): c for c in df.columns}
+    player_col = find_col_alias(cols, ["player","jugador","name","nombre"])
+    total_distance_col = find_col_alias(cols, ["total_distance","distance","distancia total","dist_total"], required=False)
+    hsr_col = find_col_alias(cols, ["hsr","high speed running"])
+    sprints_col = find_col_alias(cols, ["sprints","num_sprints","nº sprints"])
+    sprint_dist_col = find_col_alias(cols, ["distance_vrange6","sprint_distance","distancia sprint"])
+    acc_col = find_col_alias(cols, ["num_acc","acc","accelerations","aceleraciones"])
+    dec_col = find_col_alias(cols, ["num_dec","dec","decelerations","deceleraciones"])
+
     out = pd.DataFrame({
         "Fecha": pd.to_datetime(fecha),
         "Microciclo": microciclo,
-        "Jugador": df[cols["player"]].map(normalize_player_name),
-        "total_distance": df[cols["total_distance"]].map(gps_num),
-        "hsr": df[cols["hsr"]].map(gps_num),
-        "sprints": df[cols["sprints"]].map(gps_num),
-        "distance_vrange6": df[cols["distance_vrange6"]].map(gps_num),
-        "num_acc": df[cols["num_acc"]].map(gps_num),
-        "num_dec": df[cols["num_dec"]].map(gps_num),
+        "Jugador": df[player_col].map(normalize_player_name),
+        "total_distance": df[total_distance_col].map(gps_num) if total_distance_col is not None else np.nan,
+        "hsr": df[hsr_col].map(gps_num),
+        "sprints": df[sprints_col].map(gps_num),
+        "distance_vrange6": df[sprint_dist_col].map(gps_num),
+        "num_acc": df[acc_col].map(gps_num),
+        "num_dec": df[dec_col].map(gps_num),
     })
-    out["Jugador"] = out["Jugador"].replace(NAME_ALIASES)
     out["Posicion"] = out["Jugador"].map(POSITION_MAP).fillna("Sin asignar")
-    out["source_type"] = "match" if microciclo.upper() == "PARTIDO" else "session"
-    out = out.dropna(subset=["Jugador"]).copy()
-    out = out[~out["Jugador"].isin(GOALKEEPERS)].copy()
+    out = out[out["Posicion"] != "Portero"].copy()
+    out["source_type"] = "match" if str(microciclo).upper() == "PARTIDO" else "microcycle"
     return out.drop_duplicates(subset=["Fecha","Microciclo","Jugador"], keep="last")
 
 def build_match_profile(gps_df):
@@ -1074,6 +1263,10 @@ def compute_metrics(df):
     df["decision_label"] = decisions.apply(lambda x: x[0])
     df["decision_icon"] = decisions.apply(lambda x: x[1])
     df["availability_label"] = df["decision_label"].apply(availability_from_decision)
+    df["consecutive_modplus"] = (
+        df["risk_label"].isin(["Fatiga moderada","Fatiga moderada-alta","Fatiga crítica"])
+        .groupby(df["Jugador"]).cumsum()
+    )
     return df.copy()
     df = df.copy().sort_values(["Jugador","Fecha"]).reset_index(drop=True)
 
@@ -1594,7 +1787,7 @@ def player_session_html(row, player_df, session_df, gps_df=None):
       <div class="card"><div class="label">Readiness</div><div class="value">{row['readiness_score']:.0f}</div></div>
       <div class="card"><div class="label">Decisión</div><div class="value" style="font-size:20px;">{row['decision_icon']} {row['decision_label']}</div></div>
     </div>
-    <div class="section"><div class="title">Diagnóstico staff</div><div class="diag"><p><b>Perfil principal:</b> {main}.</p><p><b>Patrón:</b> {pattern}.</p><p><b>Variable dominante:</b> {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}).</p><p>{player_comment(row)}</p></div></div>
+    <div class="section"><div class="title">Diagnóstico staff</div><div class="diag"><p><b>Perfil principal:</b> {main}.</p><p><b>Patrón:</b> {pattern}.</p><p><b>Variable dominante:</b> {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}).</p><p><b>Decisión integrada:</b> {compute_integrated_player_snapshot(row["Jugador"], row["Fecha"], globals().get("LAST_METRICS_DF", pd.DataFrame()), globals().get("LAST_GPS_DF", pd.DataFrame()))["integrated_decision"]}.</p><p>{player_comment(row)}</p></div></div>
     <div class="section"><div class="title">Flags automáticos</div><ul>{flags_html}</ul></div>
     <div class="section"><div class="title">Panel visual</div><div class="grid2">{radar_html}{snapshot_html}</div><div class="grid1">{timeline_html}</div></div>
     <div class="section"><div class="title">Detalle por variable</div><table class="report-table"><thead><tr><th>Métrica</th><th>Valor</th><th>Línea base</th><th>% vs baseline</th><th>Z-score</th><th>Estado</th><th>Percentil histórico</th></tr></thead><tbody>{rows}</tbody></table></div>
@@ -1629,7 +1822,7 @@ def player_season_html(player_df, player, gps_df=None):
       <div class="card"><div class="label">Tendencia actual</div><div class="value" style="font-size:22px;">{latest['trend_label']}</div></div>
       <div class="card"><div class="label">Decisión actual</div><div class="value" style="font-size:20px;">{latest['decision_icon']} {latest['decision_label']}</div></div>
     </div>
-    <div class="section"><div class="title">Diagnóstico longitudinal</div><div class="diag"><p><b>Perfil principal actual:</b> {main}.</p><p><b>Patrón:</b> {pattern}.</p><p><b>Variable dominante:</b> {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}).</p><p>{player_comment(latest)}</p></div></div>
+    <div class="section"><div class="title">Diagnóstico longitudinal</div><div class="diag"><p><b>Perfil principal actual:</b> {main}.</p><p><b>Patrón:</b> {pattern}.</p><p><b>Variable dominante:</b> {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}).</p><p><b>Contexto:</b> {latest_context_summary(player, latest["Fecha"], globals().get("LAST_GPS_DF", pd.DataFrame()))}.</p><p>{player_comment(latest)}</p></div></div>
     <div class="section"><div class="title">Flags actuales</div><ul>{flags_html}</ul></div>
     <div class="section"><div class="title">Panel visual</div><div class="grid2">{radar_html}{timeline_html}</div><div class="grid2">{cmj_html}{rsi_html}</div><div class="grid1">{vmp_html}</div></div>
     <div class="section"><div class="title">Resumen longitudinal</div><table class="report-table"><thead><tr><th>Fecha</th><th>Loss</th><th>Pérdida %</th><th>Readiness</th><th>Riesgo</th><th>Tendencia</th></tr></thead><tbody>{rows}</tbody></table></div>
@@ -1885,11 +2078,20 @@ def page_equipo(metrics_df, gps_df):
         with c: st.plotly_chart(plot_team_heatmap(team_day), use_container_width=True)
         with d: st.plotly_chart(plot_team_objective_bar(team_day), use_container_width=True)
         st.plotly_chart(plot_team_decision_matrix(team_day), use_container_width=True)
+        st.plotly_chart(plot_integrated_team_matrix(team_day, metrics_df, gps_df, selected_date), use_container_width=True)
 
+        integrated_rows = []
+        for _, rr in team_day.iterrows():
+            ss = compute_integrated_player_snapshot(rr["Jugador"], selected_date, metrics_df, gps_df)
+            integrated_rows.append({"Jugador": rr["Jugador"], "Decisión integrada": f"{ss['integrated_icon']} {ss['integrated_decision']}", "GPS semana %": ss["gps_week_compliance"], "Carga-respuesta": ss["load_response_label"]})
+        integrated_df = pd.DataFrame(integrated_rows)
         table = team_day[["Jugador","Microciclo","CMJ_pct_vs_baseline","RSI_mod_pct_vs_baseline","VMP_pct_vs_baseline","objective_loss_mean_pct","objective_loss_score","objective_z_score","readiness_score","risk_label","trend_label","decision_label","availability_label","dominant_profile","recent_alerts_14d"]].copy()
         table.columns = ["Jugador","Día","CMJ %","RSI mod %","VMP %","Pérdida media %","Loss score","Z-score objetivo","Readiness","Riesgo","Tendencia","Decisión","Disponibilidad","Perfil dominante","Alertas 14d"]
         for col in ["CMJ %","RSI mod %","VMP %","Pérdida media %","Loss score","Z-score objetivo","Readiness"]:
             table[col] = table[col].round(2)
+        table = table.merge(integrated_df, on="Jugador", how="left")
+        if "GPS semana %" in table.columns:
+            table["GPS semana %"] = table["GPS semana %"].round(1)
         st.dataframe(table.sort_values(["Loss score","Pérdida media %"], ascending=[False, True]), use_container_width=True, hide_index=True)
 
     if not gps_day.empty:
@@ -1905,6 +2107,7 @@ def page_jugador(metrics_df, gps_df):
     if metrics_df.empty and gps_df.empty:
         st.info("No hay datos disponibles.")
         return
+    gps_df = ensure_gps_datetime(gps_df)
     st.markdown('<div class="section-title">Jugador</div>', unsafe_allow_html=True)
     players = sorted(set((metrics_df["Jugador"].dropna().unique().tolist() if not metrics_df.empty else []) + (gps_df["Jugador"].dropna().unique().tolist() if not gps_df.empty else [])))
     player = st.selectbox("Selecciona jugador", players)
@@ -1918,14 +2121,17 @@ def page_jugador(metrics_df, gps_df):
     player_df = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha") if not metrics_df.empty else pd.DataFrame()
     current = player_df[player_df["Fecha"].dt.normalize() == selected_date.normalize()] if not player_df.empty else pd.DataFrame()
     row = current.iloc[-1] if not current.empty else (player_df.iloc[-1] if not player_df.empty else None)
+    snap = compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df)
+    i_alerts = integrated_alerts_for_player(player, selected_date, metrics_df, gps_df)
 
     if row is not None:
         risk_color = RISK_COLORS.get(row["risk_label"], "#475467")
-        st.markdown(f'<div class="card"><div style="font-size:1.7rem; font-weight:900; color:#101828;">{player}</div><div style="margin-top:0.35rem;">{render_pills(row)}</div><div style="margin-top:0.55rem;"><span class="pill" style="background:{risk_color};">{row["risk_label"]}</span></div><div style="margin-top:0.7rem; color:#475467;">{player_comment(row)}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="card"><div style="font-size:1.7rem; font-weight:900; color:#101828;">{player}</div><div style="margin-top:0.35rem;">{render_pills(row)}</div><div style="margin-top:0.55rem;"><span class="pill" style="background:{risk_color};">{row["risk_label"]}</span><span class="pill" style="background:#0F766E;">{snap["integrated_icon"]} {snap["integrated_decision"]}</span></div><div style="margin-top:0.7rem; color:#475467;">{player_comment(row)}</div></div>', unsafe_allow_html=True)
         main, pattern, worst_metric, worst_value = infer_fatigue_profile(row)
         flags = flags_for_player(player_df, row)
-        if flags: st.warning(" | ".join(flags))
-        st.markdown(f"**Diagnóstico:** {main}, con {pattern}. Variable dominante: {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}). **Decisión operativa:** {row['decision_label']} ({row['availability_label']}). **Estabilidad:** {row['objective_cv_label']}.")
+        all_flags = flags + i_alerts
+        if all_flags: st.warning(" | ".join(all_flags))
+        st.markdown(f"**Diagnóstico:** {main}, con {pattern}. Variable dominante: {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}). **Decisión operativa:** {row['decision_label']} ({row['availability_label']}). **Integrada:** {snap['integrated_decision']}. **Estabilidad:** {row['objective_cv_label']}. **Contexto:** {snap['context_label']}.")
         c1,c2,c3,c4,c5,c6,c7,c8 = st.columns(8)
         with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), "control")
         with c2: kpi("Loss score", f"{row['objective_loss_score']:.2f}", "0-3")
@@ -1933,8 +2139,8 @@ def page_jugador(metrics_df, gps_df):
         with c4: kpi("Readiness", f"{row['readiness_score']:.0f}", "ese mismo día")
         with c5: kpi("Riesgo", row["risk_label"], "clasificación")
         with c6: kpi("Decisión", f"{row['decision_icon']} {row['decision_label']}", row["availability_label"])
-        with c7: kpi("Estabilidad", row["objective_cv_label"], "CV objetivo")
-        with c8: kpi("Alertas 14d", int(row["recent_alerts_14d"]), "moderada o peor")
+        with c7: kpi("Integrada", f"{snap['integrated_icon']} {snap['integrated_decision']}", snap["load_response_label"])
+        with c8: kpi("Alertas sem.", int(snap["weekly_alerts"]), snap["context_label"])
 
         a,b = st.columns(2)
         with a: st.plotly_chart(radar_relative_loss(row), use_container_width=True)
@@ -1945,9 +2151,9 @@ def page_jugador(metrics_df, gps_df):
 
         st.markdown("### Gráficas principales por variable")
         for m in OBJECTIVE_METRICS:
-            l, r = st.columns(2)
+            l, rcol = st.columns(2)
             with l: st.plotly_chart(plot_metric_main(player_df, m, selected_date), use_container_width=True)
-            with r: st.plotly_chart(plot_metric_pct(player_df, m, selected_date), use_container_width=True)
+            with rcol: st.plotly_chart(plot_metric_pct(player_df, m, selected_date), use_container_width=True)
 
     player_gps = gps_df[gps_df["Jugador"] == player].copy() if not gps_df.empty else pd.DataFrame()
     if not player_gps.empty:
@@ -1964,6 +2170,26 @@ def page_jugador(metrics_df, gps_df):
             wk_tbl = weekly_gps[["Variable","pct","min","max","status"]].copy()
             wk_tbl.columns = ["Variable","% acumulado vs partido","Objetivo mínimo (%)","Objetivo máximo (%)","Estado"]
             st.dataframe(wk_tbl.round(1), use_container_width=True, hide_index=True)
+
+    st.markdown("### Control semanal integrado")
+    ws = week_start(selected_date)
+    we = ws + pd.Timedelta(days=6)
+    player_week_fat = player_df[(player_df["Fecha"] >= ws) & (player_df["Fecha"] <= we)].copy() if not player_df.empty else pd.DataFrame()
+    ig1, ig2, ig3, ig4 = st.columns(4)
+    with ig1: kpi("Controles fatiga", int(player_week_fat[["Fecha","Microciclo"]].drop_duplicates().shape[0]) if not player_week_fat.empty else 0, "semana")
+    with ig2: kpi("Readiness sem.", "NA" if pd.isna(snap["fat_week_readiness"]) else f"{snap['fat_week_readiness']:.1f}", "media")
+    with ig3: kpi("GPS semana", "NA" if pd.isna(snap["gps_week_compliance"]) else f"{snap['gps_week_compliance']:.1f}%", "cumplimiento")
+    with ig4: kpi("Carga-respuesta", snap["load_response_label"], "integrada")
+    st.plotly_chart(plot_player_integrated_week_dashboard(player, selected_date, metrics_df, gps_df), use_container_width=True)
+
+    if not player_df.empty:
+        dist = player_distribution_summary(player_df)
+        st.markdown("### Resumen longitudinal")
+        d1,d2,d3,d4 = st.columns(4)
+        with d1: kpi("% óptimo", f"{dist.get('Estado óptimo',0):.1f}%", "temporada")
+        with d2: kpi("% leve", f"{dist.get('Fatiga leve',0)+dist.get('Fatiga leve-moderada',0):.1f}%", "temporada")
+        with d3: kpi("% moderada", f"{dist.get('Fatiga moderada',0)+dist.get('Fatiga moderada-alta',0):.1f}%", "temporada")
+        with d4: kpi("% crítica", f"{dist.get('Fatiga crítica',0):.1f}%", "temporada")
 
 def page_comparador(metrics_df):
     if metrics_df.empty:
@@ -1992,7 +2218,7 @@ def page_informes(metrics_df, gps_df):
         st.info("No hay datos disponibles.")
         return
     st.markdown('<div class="section-title">Informes descargables</div>', unsafe_allow_html=True)
-    tab1,tab2,tab3,tab4 = st.tabs(["Informe individual anual","Informe individual por sesión","Informe semanal jugador","Informe entrenador sesión"])
+    tab1,tab2,tab3,tab4 = st.tabs(["Informe individual staff anual","Informe individual staff por sesión","Informe semanal integrado jugador","Informe entrenador sesión"])
 
     with tab1:
         players = sorted(set((metrics_df["Jugador"].dropna().unique().tolist() if not metrics_df.empty else []) + (gps_df["Jugador"].dropna().unique().tolist() if not gps_df.empty else [])))
@@ -2036,7 +2262,8 @@ def page_informes(metrics_df, gps_df):
             player = st.selectbox("Jugador · informe semanal", players, key="gpswk")
             dates = sorted([pd.to_datetime(d).strftime("%Y-%m-%d") for d in gps_df[gps_df["Jugador"] == player]["Fecha"].dropna().unique()])
             sel_date = st.selectbox("Fecha de referencia semanal", dates, key="gpswkd")
-            html = f"<html><head><meta charset='utf-8'>{report_css()}</head><body><div class='hero'><div style='font-size:12px;opacity:0.9;'>Informe semanal GPS</div><div style='font-size:32px;font-weight:900;line-height:1.15;'>{player}</div><div style='font-size:15px;margin-top:6px;'>Semana de referencia: {sel_date}</div></div>{gps_player_report_html(player, gps_df, pd.to_datetime(sel_date))}</body></html>"
+            snap = compute_integrated_player_snapshot(player, pd.to_datetime(sel_date), metrics_df, gps_df)
+            html = f"<html><head><meta charset='utf-8'>{report_css()}</head><body><div class='hero'><div style='font-size:12px;opacity:0.9;'>Informe semanal integrado</div><div style='font-size:32px;font-weight:900;line-height:1.15;'>{player}</div><div style='font-size:15px;margin-top:6px;'>Semana de referencia: {sel_date}</div></div><div class='cards'><div class='card'><div class='label'>GPS semanal</div><div class='value'>{'NA' if pd.isna(snap['gps_week_compliance']) else f"{snap['gps_week_compliance']:.1f}%"}</div></div><div class='card'><div class='label'>Readiness semanal</div><div class='value'>{'NA' if pd.isna(snap['fat_week_readiness']) else f"{snap['fat_week_readiness']:.1f}"}</div></div><div class='card'><div class='label'>Carga-respuesta</div><div class='value' style='font-size:20px;'>{snap['load_response_label']}</div></div><div class='card'><div class='label'>Decisión integrada</div><div class='value' style='font-size:20px;'>{snap['integrated_icon']} {snap['integrated_decision']}</div></div></div>{gps_player_report_html(player, gps_df, pd.to_datetime(sel_date))}</body></html>"
             st.download_button("Descargar HTML semanal", data=html.encode("utf-8"), file_name=f"informe_semanal_{player.replace(' ','_')}_{sel_date}.html", mime="text/html")
             buf_story_player = player_df = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha") if not metrics_df.empty else pd.DataFrame()
             if not player_df.empty:
@@ -2118,6 +2345,8 @@ def page_admin(base_df, gps_df):
 def main():
     init_db()
     st.sidebar.markdown("## Filtros")
+    st.sidebar.markdown("### Umbrales integrados")
+    st.sidebar.caption("La lógica integrada usa tolerancias fijas para GPS y fatiga en esta versión.")
     base_df = load_monitoring()
     gps_df = load_gps()
     pos_opts = []
