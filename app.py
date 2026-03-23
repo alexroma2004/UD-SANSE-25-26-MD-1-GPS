@@ -2089,7 +2089,7 @@ def coach_session_html(team_day, selected_date, gps_df=None):
         gd = gps_compute_compliance(gdf[(gdf["Fecha"].dt.strftime("%Y-%m-%d")==str(selected_date)) & (gdf["Microciclo"].astype(str).str.upper() != "PARTIDO")].copy(), reference_df=gdf)
         if not gd.empty:
             gps_html = plotly_html(plot_team_gps_support(gd))
-    gps_block = gps_player_report_html(row["Jugador"], gps_df, row["Fecha"]) if gps_df is not None else ""
+    gps_block = gps_player_report_html(player, gps_df, latest["Fecha"]) if gps_df is not None else ""
     gps_block = gps_player_report_html(row["Jugador"], gps_df, row["Fecha"]) if gps_df is not None else ""
     return f"""
     <html><head><meta charset="utf-8">{report_css()}</head><body>
