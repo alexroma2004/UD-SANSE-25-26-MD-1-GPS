@@ -2166,7 +2166,7 @@ def player_season_html(player_df, player, gps_df=None):
     rsi_html = plotly_html(plot_metric_pct(player_df, "RSI_mod", latest["Fecha"]))
     vmp_html = plotly_html(plot_metric_pct(player_df, "VMP", latest["Fecha"]))
 
-    gps_block = gps_player_report_html(row["Jugador"], gps_df, row["Fecha"]) if gps_df is not None else ""
+    gps_block = gps_player_report_html(player, gps_df, latest["Fecha"]) if gps_df is not None else ""
     return f"""
     <html><head><meta charset="utf-8">{report_css()}</head><body>
     <div class="hero"><div style="font-size:12px;opacity:0.9;">Informe individual · Evolución anual</div><div style="font-size:32px;font-weight:900;line-height:1.15;">{player}</div><div style="font-size:15px;margin-top:6px;">Registros: {len(player_df)} · Última fecha: {pd.to_datetime(latest['Fecha']).date()}</div></div>
