@@ -255,7 +255,7 @@ def integrated_week_text(metrics_df, gps_df, selected_date):
     else:
         ws = week_start(selected_date)
         we = ws + pd.Timedelta(days=6)
-        gps_week = gps_compute_compliance(gps_df[(gps_df["Fecha"] >= ws) & (gps_df["Fecha"] <= we)].copy())
+        gps_week = gps_compute_compliance(gps_df[(gps_df["Fecha"] >= ws) & (gps_df["Fecha"] <= we)].copy(), reference_df=gps_df)
         gps_sessions = gps_week[["Fecha","Microciclo"]].drop_duplicates().shape[0] if not gps_week.empty else 0
         gps_compliance = float(gps_week["compliance_score"].mean()) if (not gps_week.empty and "compliance_score" in gps_week.columns) else np.nan
     rtxt = "NA" if pd.isna(fat["readiness_mean"]) else f"{fat['readiness_mean']:.1f}"
@@ -345,7 +345,7 @@ def compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df
 
     if gps_df is not None and not gps_df.empty:
         gps_df = ensure_gps_datetime(gps_df)
-        p_gps = gps_compute_compliance(gps_df[gps_df["Jugador"] == player].copy())
+        p_gps = gps_compute_compliance(gps_df[gps_df["Jugador"] == player].copy(), reference_df=gps_df)
         day = p_gps[p_gps["Fecha"].dt.normalize() == selected_date.normalize()].copy()
         if not day.empty and "compliance_score" in day.columns:
             out["gps_day_compliance"] = float(day["compliance_score"].mean())
@@ -876,7 +876,13 @@ def build_match_profile(gps_df):
     if gps_df.empty:
         return pd.DataFrame(columns=base_cols)
 
-    match_df = gps_df[gps_df["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy()
+    work = gps_df.copy()
+    if "Posicion" not in work.columns:
+        work["Posicion"] = work["Jugador"].map(POSITION_MAP).fillna("Sin asignar")
+    else:
+        work["Posicion"] = work["Posicion"].fillna(work["Jugador"].map(POSITION_MAP)).fillna("Sin asignar")
+
+    match_df = work[work["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy()
     if match_df.empty:
         return pd.DataFrame(columns=base_cols)
 
@@ -907,7 +913,7 @@ def build_match_profile(gps_df):
         .reset_index()
     )
 
-    players = gps_df[["Jugador", "Posicion"]].drop_duplicates().copy()
+    players = work[["Jugador", "Posicion"]].drop_duplicates().copy()
     players = players[players["Posicion"] != "Portero"].copy()
     players = players.merge(match_counts, on="Jugador", how="left")
     players["qualified_matches"] = players["qualified_matches"].fillna(0)
@@ -947,18 +953,25 @@ def gps_status_from_pct(pct, min_v, max_v):
         return ("Bajo", "#DC2626") if pct < (min_v - 15) else ("Bajo", "#F59E0B")
     return ("Alto", "#DC2626") if pct > (max_v + 15) else ("Alto", "#F59E0B")
 
-def gps_compute_compliance(gps_df):
+def gps_compute_compliance(gps_df, reference_df=None):
     gps_df = ensure_gps_datetime(gps_df)
+    if reference_df is None:
+        reference_df = gps_df
+    reference_df = ensure_gps_datetime(reference_df)
     if gps_df.empty:
         return gps_df.copy()
-    prof = build_match_profile(gps_df)
-    df = gps_df.merge(prof, on=["Jugador", "Posicion"], how="left")
+
+    prof = build_match_profile(reference_df)
+    merge_keys = ["Jugador", "Posicion"] if "Posicion" in prof.columns and "Posicion" in gps_df.columns else ["Jugador"]
+    df = gps_df.merge(prof, on=merge_keys, how="left")
+
     for m in GPS_METRICS:
         df[f"{m}_pct_match"] = np.where(
             df[f"{m}_match"].notna() & (df[f"{m}_match"] != 0),
             df[m] / df[f"{m}_match"] * 100,
             np.nan
         )
+
     for m in GPS_METRICS:
         status, colors = [], []
         for _, r in df.iterrows():
@@ -967,7 +980,8 @@ def gps_compute_compliance(gps_df):
                 stt, clr = ("Sin objetivo", "#94A3B8")
             else:
                 stt, clr = gps_status_from_pct(r.get(f"{m}_pct_match"), *tgt_map[m])
-            status.append(stt); colors.append(clr)
+            status.append(stt)
+            colors.append(clr)
         df[f"{m}_status"] = status
         df[f"{m}_status_color"] = colors
 
@@ -992,25 +1006,37 @@ def gps_player_week_table(gps_df, player, any_date):
     gps_df = ensure_gps_datetime(gps_df)
     if gps_df.empty:
         return pd.DataFrame()
+
     any_date = pd.to_datetime(any_date)
     start = any_date.normalize() - pd.Timedelta(days=any_date.weekday())
     end = start + pd.Timedelta(days=6)
-    df = gps_df[(gps_df["Jugador"] == player) & (gps_df["Fecha"] >= start) & (gps_df["Fecha"] <= end) & (gps_df["Microciclo"].str.upper() != "PARTIDO")].copy()
+
+    df = gps_df[
+        (gps_df["Jugador"] == player)
+        & (gps_df["Fecha"] >= start)
+        & (gps_df["Fecha"] <= end)
+        & (gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO")
+    ].copy()
     if df.empty:
         return pd.DataFrame()
+
     prof = build_match_profile(gps_df)
     row = df[GPS_METRICS].sum(numeric_only=True)
     out = pd.DataFrame({"Variable": [GPS_LABELS[m] for m in GPS_METRICS]})
     match_row = prof[prof["Jugador"] == player]
+
     pcts, mins, maxs, sts, colors = [], [], [], [], []
     for m in GPS_METRICS:
         match_val = match_row[f"{m}_match"].iloc[0] if not match_row.empty else np.nan
         pct = (row[m] / match_val * 100) if pd.notna(match_val) and match_val != 0 else np.nan
         pcts.append(pct)
         mn, mx = GPS_WEEKLY_TARGETS[m]
-        mins.append(mn); maxs.append(mx)
+        mins.append(mn)
+        maxs.append(mx)
         stt, clr = gps_status_from_pct(pct, mn, mx)
-        sts.append(stt); colors.append(clr)
+        sts.append(stt)
+        colors.append(clr)
+
     out["pct"] = pcts
     out["min"] = mins
     out["max"] = maxs
@@ -1022,11 +1048,13 @@ def gps_player_session_table(gps_df, player, date_value, micro=None):
     gps_df = ensure_gps_datetime(gps_df)
     if gps_df.empty:
         return pd.DataFrame()
+
     date_value = pd.to_datetime(date_value).normalize()
     full_player = gps_df[gps_df["Jugador"] == player].copy()
     if full_player.empty:
         return pd.DataFrame()
-    full_comp = gps_compute_compliance(full_player)
+
+    full_comp = gps_compute_compliance(full_player, reference_df=gps_df)
     df = full_comp[full_comp["Fecha"].dt.normalize() == date_value].copy()
     if micro is not None:
         df = df[df["Microciclo"] == micro]
@@ -1047,7 +1075,8 @@ def gps_player_session_table(gps_df, player, date_value, micro=None):
         rows.append({
             "Variable": GPS_LABELS[m],
             "pct": pct_val,
-            "min": mn, "max": mx,
+            "min": mn,
+            "max": mx,
             "status": r.get(f"{m}_status", "Sin objetivo"),
             "color": r.get(f"{m}_status_color", "#94A3B8"),
         })
@@ -2179,7 +2208,7 @@ def page_equipo(metrics_df, gps_df):
 
     gps_df = ensure_gps_datetime(gps_df)
     team_day = metrics_df[metrics_df["Fecha"].dt.normalize() == selected_date.normalize()].copy() if not metrics_df.empty else pd.DataFrame()
-    gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.normalize() == selected_date.normalize()].copy()) if not gps_df.empty else pd.DataFrame()
+    gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.normalize() == selected_date.normalize()].copy(), reference_df=gps_df) if not gps_df.empty else pd.DataFrame()
 
     c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
     with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), f"{team_day['Jugador'].nunique() if not team_day.empty else 0} jugadores fatiga")
@@ -2203,7 +2232,7 @@ def page_equipo(metrics_df, gps_df):
     if not gps_df.empty:
         ws = week_start(selected_date)
         we = ws + pd.Timedelta(days=6)
-        gps_week = gps_compute_compliance(gps_df[(gps_df["Fecha"] >= ws) & (gps_df["Fecha"] <= we)].copy())
+        gps_week = gps_compute_compliance(gps_df[(gps_df["Fecha"] >= ws) & (gps_df["Fecha"] <= we)].copy(), reference_df=gps_df)
 
     w1,w2,w3,w4 = st.columns(4)
     with w1: kpi("Readiness media semanal", "NA" if pd.isna(fat_week["readiness_mean"]) else f"{fat_week['readiness_mean']:.1f}", "fatiga")
