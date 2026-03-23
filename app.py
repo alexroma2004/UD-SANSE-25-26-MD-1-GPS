@@ -758,23 +758,25 @@ def upsert_gps(df):
             str(r["Microciclo"]),
             str(normalize_player_name(r["Jugador"])),
             None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
+            None if pd.isna(r.get("time_played")) else float(r.get("time_played")),
             None if pd.isna(r.get("total_distance")) else float(r.get("total_distance")),
             None if pd.isna(r.get("hsr")) else float(r.get("hsr")),
             None if pd.isna(r.get("sprints")) else float(r.get("sprints")),
             None if pd.isna(r.get("distance_vrange6")) else float(r.get("distance_vrange6")),
             None if pd.isna(r.get("num_acc")) else float(r.get("num_acc")),
             None if pd.isna(r.get("num_dec")) else float(r.get("num_dec")),
-            str(r.get("source_type","session")),
+            None if pd.isna(r.get("source_type")) else str(r.get("source_type")),
             now,
         ))
     conn = get_conn()
     cur = conn.cursor()
     cur.executemany("""
         INSERT INTO gps_data
-        (Fecha, Microciclo, Jugador, Posicion, total_distance, hsr, sprints, distance_vrange6, num_acc, num_dec, source_type, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (Fecha, Microciclo, Jugador, Posicion, time_played, total_distance, hsr, sprints, distance_vrange6, num_acc, num_dec, source_type, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(Fecha, Microciclo, Jugador) DO UPDATE SET
             Posicion=excluded.Posicion,
+            time_played=excluded.time_played,
             total_distance=excluded.total_distance,
             hsr=excluded.hsr,
             sprints=excluded.sprints,
@@ -826,6 +828,7 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
             if required:
                 raise ValueError(f"No se encontró ninguna de estas columnas: {aliases}")
             return None
+
     name = uploaded_file.name.lower()
     sep = ";" if name.endswith(".csv") else None
     if name.endswith(".csv"):
@@ -833,15 +836,22 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
     else:
         df = pd.read_excel(uploaded_file)
 
+    df.columns = [str(c).strip() for c in df.columns]
     cols = {str(c).lower().strip(): c for c in df.columns}
-    player_col = local_find_col_alias(cols, ["player","jugador","name","nombre"])
-    total_distance_col = local_find_col_alias(cols, ["total_distance","distance","distancia total","dist_total"], required=False)
-    hsr_col = local_find_col_alias(cols, ["hsr","high speed running"])
-    sprints_col = local_find_col_alias(cols, ["sprints","num_sprints","nº sprints"])
-    sprint_dist_col = local_find_col_alias(cols, ["distance_vrange6","sprint_distance","distancia sprint"])
-    acc_col = local_find_col_alias(cols, ["num_acc","acc","accelerations","aceleraciones"])
-    dec_col = local_find_col_alias(cols, ["num_dec","dec","decelerations","deceleraciones"])
-    time_col = local_find_col_alias(cols, ["time","time ","minutes","minutos","duration"], required=False)
+
+    player_col = local_find_col_alias(cols, ["player", "jugador", "name", "nombre"])
+    total_distance_col = local_find_col_alias(cols, ["total_distance"], required=False)
+    hsr_col = local_find_col_alias(cols, ["hsr"])
+    sprints_col = local_find_col_alias(cols, ["sprints"])
+    sprint_dist_col = local_find_col_alias(cols, ["distance_vrange6"], required=False)
+    acc_col = local_find_col_alias(cols, ["num_acc"])
+    dec_col = local_find_col_alias(cols, ["num_dec"])
+    time_col = local_find_col_alias(cols, ["time", "time ", "minutes", "minutos", "duration"], required=False)
+
+    if total_distance_col is None:
+        total_distance_col = local_find_col_alias(cols, ["distance", "distancia total", "dist_total"], required=False)
+    if sprint_dist_col is None:
+        sprint_dist_col = local_find_col_alias(cols, ["sprint_distance", "distancia sprint"], required=False)
 
     out = pd.DataFrame({
         "Fecha": pd.to_datetime(fecha),
@@ -851,7 +861,7 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
         "total_distance": df[total_distance_col].map(gps_num) if total_distance_col is not None else np.nan,
         "hsr": df[hsr_col].map(gps_num),
         "sprints": df[sprints_col].map(gps_num),
-        "distance_vrange6": df[sprint_dist_col].map(gps_num),
+        "distance_vrange6": df[sprint_dist_col].map(gps_num) if sprint_dist_col is not None else np.nan,
         "num_acc": df[acc_col].map(gps_num),
         "num_dec": df[dec_col].map(gps_num),
     })
@@ -874,7 +884,6 @@ def build_match_profile(gps_df):
         match_df["time_played"] = np.nan
     match_df["time_played"] = pd.to_numeric(match_df["time_played"], errors="coerce")
 
-    # Solo cuentan partidos con 80' o más
     qualified = match_df[match_df["time_played"] >= GPS_MATCH_MINUTES_MIN].copy()
     if qualified.empty:
         return pd.DataFrame(columns=base_cols)
@@ -882,7 +891,6 @@ def build_match_profile(gps_df):
     match_counts = qualified.groupby("Jugador").size().rename("qualified_matches").reset_index()
     eligible_players = set(match_counts.loc[match_counts["qualified_matches"] >= GPS_MATCH_MIN_MATCHES, "Jugador"].tolist())
 
-    # Perfil propio: media de los partidos cualificados de jugadores con mínimo 5 partidos
     self_profiles = (
         qualified[qualified["Jugador"].isin(eligible_players)]
         .groupby(["Jugador", "Posicion"], dropna=False)[GPS_METRICS]
@@ -892,23 +900,13 @@ def build_match_profile(gps_df):
     )
     self_profiles["profile_source"] = "propio"
 
-    # Perfil por posición: media de los partidos cualificados de jugadores elegibles de esa posición
     pos_profiles = (
         qualified[qualified["Jugador"].isin(eligible_players)]
         .groupby("Posicion", dropna=False)[GPS_METRICS]
         .mean()
         .reset_index()
     )
-    pos_counts = (
-        qualified[qualified["Jugador"].isin(eligible_players)]
-        .groupby("Posicion")["Jugador"]
-        .nunique()
-        .rename("position_eligible_players")
-        .reset_index()
-    )
-    pos_profiles = pos_profiles.merge(pos_counts, on="Posicion", how="left")
 
-    # Jugadores conocidos para construir perfil final
     players = gps_df[["Jugador", "Posicion"]].drop_duplicates().copy()
     players = players[players["Posicion"] != "Portero"].copy()
     players = players.merge(match_counts, on="Jugador", how="left")
@@ -956,7 +954,11 @@ def gps_compute_compliance(gps_df):
     prof = build_match_profile(gps_df)
     df = gps_df.merge(prof, on=["Jugador", "Posicion"], how="left")
     for m in GPS_METRICS:
-        df[f"{m}_pct_match"] = np.where(df[f"{m}_match"].notna() & (df[f"{m}_match"] != 0), df[m] / df[f"{m}_match"] * 100, np.nan)
+        df[f"{m}_pct_match"] = np.where(
+            df[f"{m}_match"].notna() & (df[f"{m}_match"] != 0),
+            df[m] / df[f"{m}_match"] * 100,
+            np.nan
+        )
     for m in GPS_METRICS:
         status, colors = [], []
         for _, r in df.iterrows():
@@ -1009,7 +1011,11 @@ def gps_player_week_table(gps_df, player, any_date):
         mins.append(mn); maxs.append(mx)
         stt, clr = gps_status_from_pct(pct, mn, mx)
         sts.append(stt); colors.append(clr)
-    out["pct"] = pcts; out["min"] = mins; out["max"] = maxs; out["status"] = sts; out["color"] = colors
+    out["pct"] = pcts
+    out["min"] = mins
+    out["max"] = maxs
+    out["status"] = sts
+    out["color"] = colors
     return out
 
 def gps_player_session_table(gps_df, player, date_value, micro=None):
@@ -1017,20 +1023,30 @@ def gps_player_session_table(gps_df, player, date_value, micro=None):
     if gps_df.empty:
         return pd.DataFrame()
     date_value = pd.to_datetime(date_value).normalize()
-    df = gps_df[(gps_df["Jugador"] == player) & (gps_df["Fecha"].dt.normalize() == date_value)].copy()
+    full_player = gps_df[gps_df["Jugador"] == player].copy()
+    if full_player.empty:
+        return pd.DataFrame()
+    full_comp = gps_compute_compliance(full_player)
+    df = full_comp[full_comp["Fecha"].dt.normalize() == date_value].copy()
     if micro is not None:
         df = df[df["Microciclo"] == micro]
     if df.empty:
         return pd.DataFrame()
-    df = gps_compute_compliance(df)
-    r = df.iloc[-1]
+
+    non_match_df = df[df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy()
+    if not non_match_df.empty:
+        r = non_match_df.sort_values(["Fecha", "Microciclo"]).iloc[-1]
+    else:
+        r = df.sort_values(["Fecha", "Microciclo"]).iloc[-1]
+
     rows = []
     targets = GPS_DAILY_TARGETS.get(str(r["Microciclo"]).upper(), {})
     for m in GPS_METRICS:
         mn, mx = targets.get(m, (np.nan, np.nan))
+        pct_val = r.get(f"{m}_pct_match", np.nan)
         rows.append({
             "Variable": GPS_LABELS[m],
-            "pct": r.get(f"{m}_pct_match", np.nan),
+            "pct": pct_val,
             "min": mn, "max": mx,
             "status": r.get(f"{m}_status", "Sin objetivo"),
             "color": r.get(f"{m}_status_color", "#94A3B8"),
