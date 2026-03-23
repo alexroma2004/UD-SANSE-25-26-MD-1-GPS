@@ -204,6 +204,24 @@ def ensure_gps_datetime(df):
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     return df
 
+
+def latest_nonmatch_date(metrics_df=None, gps_df=None, player=None):
+    candidates = []
+    if metrics_df is not None and not metrics_df.empty:
+        mdf = metrics_df.copy()
+        if player is not None and "Jugador" in mdf.columns:
+            mdf = mdf[mdf["Jugador"] == player]
+        candidates.extend(pd.to_datetime(mdf["Fecha"], errors="coerce").dropna().tolist())
+    if gps_df is not None and not gps_df.empty:
+        gdf = ensure_gps_datetime(gps_df)
+        if player is not None and "Jugador" in gdf.columns:
+            gdf = gdf[gdf["Jugador"] == player]
+        gdf = gdf[gdf["Microciclo"].astype(str).str.upper() != "PARTIDO"]
+        candidates.extend(pd.to_datetime(gdf["Fecha"], errors="coerce").dropna().tolist())
+    if not candidates:
+        return None
+    return max(candidates)
+
 def week_start(date_like):
     d = pd.to_datetime(date_like, errors="coerce")
     if pd.isna(d):
@@ -2204,11 +2222,14 @@ def page_equipo(metrics_df, gps_df):
         return
 
     opts = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in all_dates]
-    selected_date = pd.to_datetime(st.selectbox("Fecha de análisis", opts, index=len(opts)-1))
+    pref_date = latest_nonmatch_date(metrics_df, gps_df)
+    pref_str = pd.to_datetime(pref_date).strftime("%Y-%m-%d") if pref_date is not None else opts[-1]
+    pref_idx = opts.index(pref_str) if pref_str in opts else len(opts)-1
+    selected_date = pd.to_datetime(st.selectbox("Fecha de análisis", opts, index=pref_idx))
 
     gps_df = ensure_gps_datetime(gps_df)
     team_day = metrics_df[metrics_df["Fecha"].dt.normalize() == selected_date.normalize()].copy() if not metrics_df.empty else pd.DataFrame()
-    gps_day = gps_compute_compliance(gps_df[gps_df["Fecha"].dt.normalize() == selected_date.normalize()].copy(), reference_df=gps_df) if not gps_df.empty else pd.DataFrame()
+    gps_day = gps_compute_compliance(gps_df[(gps_df["Fecha"].dt.normalize() == selected_date.normalize()) & (gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO")].copy(), reference_df=gps_df) if not gps_df.empty else pd.DataFrame()
 
     c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
     with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), f"{team_day['Jugador'].nunique() if not team_day.empty else 0} jugadores fatiga")
@@ -2336,7 +2357,10 @@ def page_jugador(metrics_df, gps_df):
     if not gps_df.empty:
         source_dates += [pd.to_datetime(d).strftime("%Y-%m-%d") for d in gps_df[gps_df["Jugador"] == player]["Fecha"].dropna().unique()]
     opts = sorted(set(source_dates))
-    selected_date = pd.to_datetime(st.selectbox("Fecha del jugador", opts, index=len(opts)-1))
+    pref_date = latest_nonmatch_date(metrics_df, gps_df, player=player)
+    pref_str = pd.to_datetime(pref_date).strftime("%Y-%m-%d") if pref_date is not None else opts[-1]
+    pref_idx = opts.index(pref_str) if pref_str in opts else len(opts)-1
+    selected_date = pd.to_datetime(st.selectbox("Fecha del jugador", opts, index=pref_idx))
     player_df = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha") if not metrics_df.empty else pd.DataFrame()
     current = player_df[player_df["Fecha"].dt.normalize() == selected_date.normalize()] if not player_df.empty else pd.DataFrame()
     row = current.iloc[-1] if not current.empty else (player_df.iloc[-1] if not player_df.empty else None)
@@ -2374,7 +2398,7 @@ def page_jugador(metrics_df, gps_df):
             with l: st.plotly_chart(plot_metric_main(player_df, m, selected_date), use_container_width=True)
             with rcol: st.plotly_chart(plot_metric_pct(player_df, m, selected_date), use_container_width=True)
 
-    player_gps = gps_df[gps_df["Jugador"] == player].copy() if not gps_df.empty else pd.DataFrame()
+    player_gps = gps_df[(gps_df["Jugador"] == player)].copy() if not gps_df.empty else pd.DataFrame()
     if not player_gps.empty:
         st.markdown("## Carga GPS")
         session_gps = gps_player_session_table(gps_df, player, selected_date)
