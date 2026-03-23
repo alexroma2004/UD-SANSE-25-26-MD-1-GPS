@@ -85,6 +85,9 @@ GPS_WEEKLY_TARGETS = {
     "num_dec": (145, 185),
 }
 
+GPS_MATCH_MINUTES_MIN = 80
+GPS_MATCH_MIN_MATCHES = 5
+
 st.markdown("""
 <style>
 .block-container {padding-top: 2rem; padding-bottom: 1.25rem;}
@@ -150,6 +153,7 @@ def init_db():
             Microciclo TEXT NOT NULL,
             Jugador TEXT NOT NULL,
             Posicion TEXT,
+            time_played REAL,
             total_distance REAL,
             hsr REAL,
             sprints REAL,
@@ -161,6 +165,10 @@ def init_db():
             PRIMARY KEY (Fecha, Microciclo, Jugador)
         )
     """)
+    try:
+        cur.execute("ALTER TABLE gps_data ADD COLUMN time_played REAL")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -833,11 +841,13 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
     sprint_dist_col = local_find_col_alias(cols, ["distance_vrange6","sprint_distance","distancia sprint"])
     acc_col = local_find_col_alias(cols, ["num_acc","acc","accelerations","aceleraciones"])
     dec_col = local_find_col_alias(cols, ["num_dec","dec","decelerations","deceleraciones"])
+    time_col = local_find_col_alias(cols, ["time","time ","minutes","minutos","duration"], required=False)
 
     out = pd.DataFrame({
         "Fecha": pd.to_datetime(fecha),
         "Microciclo": microciclo,
         "Jugador": df[player_col].map(normalize_player_name),
+        "time_played": df[time_col].map(gps_num) if time_col is not None else np.nan,
         "total_distance": df[total_distance_col].map(gps_num) if total_distance_col is not None else np.nan,
         "hsr": df[hsr_col].map(gps_num),
         "sprints": df[sprints_col].map(gps_num),
@@ -852,13 +862,83 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
 
 def build_match_profile(gps_df):
     gps_df = ensure_gps_datetime(gps_df)
+    base_cols = ["Jugador", "Posicion", "profile_source", "qualified_matches", *[f"{m}_match" for m in GPS_METRICS]]
     if gps_df.empty:
-        return pd.DataFrame(columns=["Jugador", *[f"{m}_match" for m in GPS_METRICS]])
-    match_df = gps_df[gps_df["Microciclo"].str.upper() == "PARTIDO"].copy()
+        return pd.DataFrame(columns=base_cols)
+
+    match_df = gps_df[gps_df["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy()
     if match_df.empty:
-        return pd.DataFrame(columns=["Jugador", *[f"{m}_match" for m in GPS_METRICS]])
-    prof = match_df.groupby("Jugador")[GPS_METRICS].mean().reset_index()
-    return prof.rename(columns={m: f"{m}_match" for m in GPS_METRICS})
+        return pd.DataFrame(columns=base_cols)
+
+    if "time_played" not in match_df.columns:
+        match_df["time_played"] = np.nan
+    match_df["time_played"] = pd.to_numeric(match_df["time_played"], errors="coerce")
+
+    # Solo cuentan partidos con 80' o más
+    qualified = match_df[match_df["time_played"] >= GPS_MATCH_MINUTES_MIN].copy()
+    if qualified.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    match_counts = qualified.groupby("Jugador").size().rename("qualified_matches").reset_index()
+    eligible_players = set(match_counts.loc[match_counts["qualified_matches"] >= GPS_MATCH_MIN_MATCHES, "Jugador"].tolist())
+
+    # Perfil propio: media de los partidos cualificados de jugadores con mínimo 5 partidos
+    self_profiles = (
+        qualified[qualified["Jugador"].isin(eligible_players)]
+        .groupby(["Jugador", "Posicion"], dropna=False)[GPS_METRICS]
+        .mean()
+        .reset_index()
+        .merge(match_counts, on="Jugador", how="left")
+    )
+    self_profiles["profile_source"] = "propio"
+
+    # Perfil por posición: media de los partidos cualificados de jugadores elegibles de esa posición
+    pos_profiles = (
+        qualified[qualified["Jugador"].isin(eligible_players)]
+        .groupby("Posicion", dropna=False)[GPS_METRICS]
+        .mean()
+        .reset_index()
+    )
+    pos_counts = (
+        qualified[qualified["Jugador"].isin(eligible_players)]
+        .groupby("Posicion")["Jugador"]
+        .nunique()
+        .rename("position_eligible_players")
+        .reset_index()
+    )
+    pos_profiles = pos_profiles.merge(pos_counts, on="Posicion", how="left")
+
+    # Jugadores conocidos para construir perfil final
+    players = gps_df[["Jugador", "Posicion"]].drop_duplicates().copy()
+    players = players[players["Posicion"] != "Portero"].copy()
+    players = players.merge(match_counts, on="Jugador", how="left")
+    players["qualified_matches"] = players["qualified_matches"].fillna(0)
+
+    final_rows = []
+    for _, r in players.iterrows():
+        player = r["Jugador"]
+        pos = r["Posicion"]
+        qn = int(r["qualified_matches"])
+        if player in eligible_players:
+            src = self_profiles[self_profiles["Jugador"] == player]
+            if not src.empty:
+                row = {"Jugador": player, "Posicion": pos, "profile_source": "propio", "qualified_matches": qn}
+                for m in GPS_METRICS:
+                    row[f"{m}_match"] = src.iloc[0][m]
+                final_rows.append(row)
+                continue
+
+        pos_src = pos_profiles[pos_profiles["Posicion"] == pos]
+        row = {"Jugador": player, "Posicion": pos, "profile_source": "posición", "qualified_matches": qn}
+        if not pos_src.empty:
+            for m in GPS_METRICS:
+                row[f"{m}_match"] = pos_src.iloc[0][m]
+        else:
+            for m in GPS_METRICS:
+                row[f"{m}_match"] = np.nan
+        final_rows.append(row)
+
+    return pd.DataFrame(final_rows, columns=base_cols)
 
 def gps_status_from_pct(pct, min_v, max_v):
     if pd.isna(pct):
@@ -874,7 +954,7 @@ def gps_compute_compliance(gps_df):
     if gps_df.empty:
         return gps_df.copy()
     prof = build_match_profile(gps_df)
-    df = gps_df.merge(prof, on="Jugador", how="left")
+    df = gps_df.merge(prof, on=["Jugador", "Posicion"], how="left")
     for m in GPS_METRICS:
         df[f"{m}_pct_match"] = np.where(df[f"{m}_match"].notna() & (df[f"{m}_match"] != 0), df[m] / df[f"{m}_match"] * 100, np.nan)
     for m in GPS_METRICS:
@@ -888,6 +968,22 @@ def gps_compute_compliance(gps_df):
             status.append(stt); colors.append(clr)
         df[f"{m}_status"] = status
         df[f"{m}_status_color"] = colors
+
+    def _session_status(row):
+        vals = [str(row.get(f"{m}_status", "")) for m in GPS_METRICS]
+        if all(v == "Sin referencia" for v in vals):
+            return "Sin referencia"
+        if any(v == "Alto" for v in vals):
+            return "Alto"
+        if any(v == "Bajo" for v in vals):
+            return "Bajo"
+        if any(v == "Adecuado" for v in vals):
+            return "Adecuado"
+        return "Sin objetivo"
+
+    pct_cols = [f"{m}_pct_match" for m in GPS_METRICS]
+    df["compliance_score"] = df[pct_cols].mean(axis=1, skipna=True)
+    df["session_status"] = df.apply(_session_status, axis=1)
     return df
 
 def gps_player_week_table(gps_df, player, any_date):
@@ -946,11 +1042,12 @@ def gps_progress_bars_html(df, title):
         return "<div class='section'><div class='title'>" + title + "</div><div class='muted'>Sin datos GPS disponibles.</div></div>"
     blocks = []
     for _, r in df.iterrows():
-        pct = 0 if pd.isna(r["pct"]) else float(r["pct"])
-        width = max(0, min(100, pct))
+        pct = np.nan if pd.isna(r["pct"]) else float(r["pct"])
+        width = 0 if pd.isna(pct) else max(0, min(100, pct))
+        pct_txt = "Sin referencia" if pd.isna(pct) else f"{pct:.1f}%"
         blocks.append(
             f"<div style='margin-bottom:10px;'><div style='display:flex;justify-content:space-between;font-size:13px;'>"
-            f"<span><strong>{r['Variable']}</strong></span><span>{pct:.1f}% (objetivo {r['min']}-{r['max']}%)</span></div>"
+            f"<span><strong>{r['Variable']}</strong></span><span>{pct_txt} (objetivo {r['min']}-{r['max']}%)</span></div>"
             f"<div style='width:100%;background:#E5E7EB;border-radius:999px;height:12px;overflow:hidden;'><div style='width:{width}%;background:{r['color']};height:12px;'></div></div></div>"
         )
     return f"<div class='section'><div class='title'>{title}</div>{''.join(blocks)}</div>"
