@@ -3433,6 +3433,20 @@ def style_staff_table(staff_df, sort_col=None):
         }
         return cmap.get(str(val), "")
 
+    def _fatigue_bg(val):
+        cmap = {
+            "Estado óptimo": "background-color: rgba(21,128,61,0.14); color:#166534; font-weight:700;",
+            "Buen estado": "background-color: rgba(46,139,87,0.14); color:#166534; font-weight:700;",
+            "Fatiga leve": "background-color: rgba(227,160,8,0.16); color:#854d0e; font-weight:700;",
+            "Fatiga leve-moderada": "background-color: rgba(245,158,11,0.18); color:#9a3412; font-weight:700;",
+            "Fatiga moderada": "background-color: rgba(249,115,22,0.18); color:#9a3412; font-weight:700;",
+            "Fatiga moderada-alta": "background-color: rgba(234,88,12,0.18); color:#9a3412; font-weight:700;",
+            "Fatiga crítica": "background-color: rgba(185,28,28,0.18); color:#991b1b; font-weight:700;",
+            "Sin dato": "background-color: rgba(148,163,184,0.18); color:#475569; font-weight:700;",
+            "Sin referencia": "background-color: rgba(148,163,184,0.18); color:#475569; font-weight:700;",
+        }
+        return cmap.get(str(val), "")
+
     styler = show.style
     if "Readiness" in show.columns:
         styler = styler.bar(subset=["Readiness"], align="mid", color="#93C5FD")
@@ -3443,7 +3457,7 @@ def style_staff_table(staff_df, sort_col=None):
     if "Decisión" in show.columns:
         styler = styler.map(_decision_bg, subset=["Decisión"])
     if "Estado fatiga" in show.columns:
-        styler = styler.background_gradient(subset=["Estado fatiga"], cmap="RdYlGn")
+        styler = styler.map(_fatigue_bg, subset=["Estado fatiga"])
     return styler
 
 def visual_alert_block(lines, title="Top alerts"):
