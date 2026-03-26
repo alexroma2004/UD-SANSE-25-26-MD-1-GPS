@@ -144,6 +144,20 @@ def load_monitoring():
     df = pd.DataFrame(data)
     if df.empty:
         return pd.DataFrame(columns=["Fecha","Jugador","Microciclo","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"])
+    rename_map = {
+        "fecha": "Fecha",
+        "microciclo": "Microciclo",
+        "jugador": "Jugador",
+        "posicion": "Posicion",
+        "minutos": "Minutos",
+        "cmj": "CMJ",
+        "rsi_mod": "RSI_mod",
+        "vmp": "VMP",
+        "srpe": "sRPE",
+        "observaciones": "Observaciones",
+        "updated_at": "updated_at",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     if "Microciclo" not in df.columns:
         df["Microciclo"] = np.nan
@@ -711,19 +725,19 @@ def upsert_monitoring(df):
     payload = []
     for _, r in df.iterrows():
         payload.append({
-            "Fecha": str(pd.to_datetime(r["Fecha"]).date()),
-            "Jugador": str(normalize_player_name(r["Jugador"])),
-            "Microciclo": None if pd.isna(r.get("Microciclo")) else str(r.get("Microciclo")),
-            "Posicion": None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
-            "Minutos": None if pd.isna(r.get("Minutos")) else float(r.get("Minutos")),
-            "CMJ": None if pd.isna(r.get("CMJ")) else float(r.get("CMJ")),
-            "RSI_mod": None if pd.isna(r.get("RSI_mod")) else float(r.get("RSI_mod")),
-            "VMP": None if pd.isna(r.get("VMP")) else float(r.get("VMP")),
-            "sRPE": None if pd.isna(r.get("sRPE")) else float(r.get("sRPE")),
-            "Observaciones": None if pd.isna(r.get("Observaciones")) else str(r.get("Observaciones")),
+            "fecha": str(pd.to_datetime(r["Fecha"]).date()),
+            "jugador": str(normalize_player_name(r["Jugador"])),
+            "microciclo": None if pd.isna(r.get("Microciclo")) else str(r.get("Microciclo")),
+            "posicion": None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
+            "minutos": None if pd.isna(r.get("Minutos")) else float(r.get("Minutos")),
+            "cmj": None if pd.isna(r.get("CMJ")) else float(r.get("CMJ")),
+            "rsi_mod": None if pd.isna(r.get("RSI_mod")) else float(r.get("RSI_mod")),
+            "vmp": None if pd.isna(r.get("VMP")) else float(r.get("VMP")),
+            "srpe": None if pd.isna(r.get("sRPE")) else float(r.get("sRPE")),
+            "observaciones": None if pd.isna(r.get("Observaciones")) else str(r.get("Observaciones")),
             "updated_at": now,
         })
-    supabase.table(SUPABASE_MONITORING_TABLE).upsert(payload, on_conflict="Fecha,Jugador,Microciclo").execute()
+    supabase.table(SUPABASE_MONITORING_TABLE).upsert(payload, on_conflict="fecha,jugador,microciclo").execute()
 
 # =========================================================
 # PARSER
@@ -972,6 +986,22 @@ def load_gps():
     df = pd.DataFrame(data)
     if df.empty:
         return pd.DataFrame(columns=["Fecha","Microciclo","Jugador","Posicion","time_played",*GPS_METRICS,"source_type"])
+    rename_map = {
+        "fecha": "Fecha",
+        "microciclo": "Microciclo",
+        "jugador": "Jugador",
+        "posicion": "Posicion",
+        "time_played": "time_played",
+        "total_distance": "total_distance",
+        "hsr": "hsr",
+        "sprints": "sprints",
+        "distance_vrange6": "distance_vrange6",
+        "num_acc": "num_acc",
+        "num_dec": "num_dec",
+        "source_type": "source_type",
+        "updated_at": "updated_at",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     if "time_played" not in df.columns:
         df["time_played"] = np.nan
@@ -989,10 +1019,10 @@ def upsert_gps(df):
     payload = []
     for _, r in df.iterrows():
         payload.append({
-            "Fecha": str(pd.to_datetime(r["Fecha"]).date()),
-            "Microciclo": str(r["Microciclo"]),
-            "Jugador": str(normalize_player_name(r["Jugador"])),
-            "Posicion": None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
+            "fecha": str(pd.to_datetime(r["Fecha"]).date()),
+            "microciclo": str(r["Microciclo"]),
+            "jugador": str(normalize_player_name(r["Jugador"])),
+            "posicion": None if pd.isna(r.get("Posicion")) else str(r.get("Posicion")),
             "time_played": None if pd.isna(r.get("time_played")) else float(r.get("time_played")),
             "total_distance": None if pd.isna(r.get("total_distance")) else float(r.get("total_distance")),
             "hsr": None if pd.isna(r.get("hsr")) else float(r.get("hsr")),
@@ -1003,19 +1033,19 @@ def upsert_gps(df):
             "source_type": None if pd.isna(r.get("source_type")) else str(r.get("source_type")),
             "updated_at": now,
         })
-    supabase.table(SUPABASE_GPS_TABLE).upsert(payload, on_conflict="Fecha,Microciclo,Jugador").execute()
+    supabase.table(SUPABASE_GPS_TABLE).upsert(payload, on_conflict="fecha,microciclo,jugador").execute()
 
 def delete_fatigue_session(date_str, micro=None):
     supabase = get_supabase()
-    query = supabase.table(SUPABASE_MONITORING_TABLE).delete().eq("Fecha", date_str)
+    query = supabase.table(SUPABASE_MONITORING_TABLE).delete().eq("fecha", date_str)
     if micro is None or micro == "" or str(micro).lower() == "nan":
         query.execute()
     else:
-        query.eq("Microciclo", micro).execute()
+        query.eq("microciclo", micro).execute()
 
 def delete_gps_session(date_str, micro):
     supabase = get_supabase()
-    supabase.table(SUPABASE_GPS_TABLE).delete().eq("Fecha", date_str).eq("Microciclo", micro).execute()
+    supabase.table(SUPABASE_GPS_TABLE).delete().eq("fecha", date_str).eq("microciclo", micro).execute()
 
 
 
@@ -2761,7 +2791,7 @@ def page_admin(base_df, gps_df):
 # =========================================================
 def delete_gps_match(date_str):
     supabase = get_supabase()
-    supabase.table(SUPABASE_GPS_TABLE).delete().eq("Fecha", date_str).eq("Microciclo", "PARTIDO").execute()
+    supabase.table(SUPABASE_GPS_TABLE).delete().eq("fecha", date_str).eq("microciclo", "PARTIDO").execute()
 
 def line_group_from_position(pos):
     pos = str(pos) if pd.notna(pos) else "Sin asignar"
@@ -3433,6 +3463,20 @@ def style_staff_table(staff_df, sort_col=None):
         }
         return cmap.get(str(val), "")
 
+    def _fatigue_bg(val):
+        cmap = {
+            "Estado óptimo": "background-color: rgba(21,128,61,0.14); color:#166534; font-weight:700;",
+            "Buen estado": "background-color: rgba(46,139,87,0.14); color:#166534; font-weight:700;",
+            "Fatiga leve": "background-color: rgba(227,160,8,0.16); color:#854d0e; font-weight:700;",
+            "Fatiga leve-moderada": "background-color: rgba(245,158,11,0.18); color:#9a3412; font-weight:700;",
+            "Fatiga moderada": "background-color: rgba(249,115,22,0.18); color:#9a3412; font-weight:700;",
+            "Fatiga moderada-alta": "background-color: rgba(234,88,12,0.18); color:#9a3412; font-weight:700;",
+            "Fatiga crítica": "background-color: rgba(185,28,28,0.18); color:#991b1b; font-weight:700;",
+            "Sin dato": "background-color: rgba(148,163,184,0.18); color:#475569; font-weight:700;",
+            "Sin referencia": "background-color: rgba(148,163,184,0.18); color:#475569; font-weight:700;",
+        }
+        return cmap.get(str(val), "")
+
     styler = show.style
     if "Readiness" in show.columns:
         styler = styler.bar(subset=["Readiness"], align="mid", color="#93C5FD")
@@ -3443,7 +3487,7 @@ def style_staff_table(staff_df, sort_col=None):
     if "Decisión" in show.columns:
         styler = styler.map(_decision_bg, subset=["Decisión"])
     if "Estado fatiga" in show.columns:
-        styler = styler.background_gradient(subset=["Estado fatiga"], cmap="RdYlGn")
+        styler = styler.map(_fatigue_bg, subset=["Estado fatiga"])
     return styler
 
 def visual_alert_block(lines, title="Top alerts"):
@@ -4105,11 +4149,8 @@ def main():
 # PROFESSIONAL ENHANCEMENTS V4
 # =========================================================
 def delete_gps_match(date_str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM gps_data WHERE Fecha = ? AND UPPER(Microciclo) = 'PARTIDO'", (date_str,))
-    conn.commit()
-    conn.close()
+    supabase = get_supabase()
+    supabase.table(SUPABASE_GPS_TABLE).delete().eq("fecha", date_str).eq("microciclo", "PARTIDO").execute()
 
 def line_group_from_position(pos):
     pos = str(pos) if pd.notna(pos) else "Sin asignar"
@@ -4430,9 +4471,12 @@ def page_cargar():
                 cols_show = [c for c in ["Fecha","Microciclo","Jugador","Posicion","CMJ","RSI_mod","VMP","sRPE","Observaciones"] if c in parsed.columns]
                 st.dataframe(parsed[cols_show], use_container_width=True, hide_index=True)
                 if st.button("Guardar control de fatiga", type="primary", key="save_fat_v4"):
-                    upsert_monitoring(parsed)
-                    st.success("Datos de fatiga guardados correctamente.")
-                    st.rerun()
+                    try:
+                        upsert_monitoring(parsed)
+                        st.success("Datos de fatiga guardados correctamente.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error al guardar en Supabase (fatiga): {e}")
             except Exception as e:
                 st.error(f"No se pudo interpretar el archivo de fatiga: {e}")
     with c2:
@@ -4452,9 +4496,12 @@ def page_cargar():
                     st.caption(f"Referencias GPS disponibles actualmente: {len(ref_prof)} perfiles ({n_self} propios, {len(ref_prof)-n_self} por posición)")
                 st.dataframe(parsed_gps[["Fecha","Microciclo","Jugador","Posicion",*GPS_METRICS]], use_container_width=True, hide_index=True)
                 if st.button("Guardar sesión GPS", key="save_gps_v4"):
-                    upsert_gps(parsed_gps)
-                    st.success("Datos GPS guardados correctamente.")
-                    st.rerun()
+                    try:
+                        upsert_gps(parsed_gps)
+                        st.success("Datos GPS guardados correctamente.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error al guardar en Supabase (GPS): {e}")
             except Exception as e:
                 st.error(f"No se pudo interpretar el archivo GPS: {e}")
 
