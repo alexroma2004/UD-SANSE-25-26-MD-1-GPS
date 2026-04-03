@@ -128,7 +128,7 @@ st.markdown("""
 @st.cache_resource
 def get_supabase() -> Client:
     url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
     return create_client(url, key)
 
 def init_db():
@@ -4951,6 +4951,1031 @@ def main():
         page_equipo(metrics_df, gps_df)
     elif menu == "Jugador":
         page_jugador(metrics_df, gps_df)
+    elif menu == "Informes":
+        page_informes(metrics_df, gps_df)
+    else:
+        page_admin(base_df, gps_df)
+
+
+
+# =========================================================
+# ADMIN ADVANCED OVERRIDES
+# =========================================================
+def _to_excel_bytes(sheet_map):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheet_map.items():
+            safe_sheet = str(sheet_name)[:31]
+            (df if df is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name=safe_sheet)
+    output.seek(0)
+    return output.getvalue()
+
+def _monitoring_session_list(base_df):
+    if base_df is None or base_df.empty:
+        return []
+    temp = base_df.copy()
+    temp["Fecha"] = pd.to_datetime(temp["Fecha"], errors="coerce")
+    if "Microciclo" not in temp.columns:
+        temp["Microciclo"] = np.nan
+    sess = temp[["Fecha","Microciclo"]].drop_duplicates().sort_values(["Fecha","Microciclo"], na_position="last")
+    labels = []
+    for _, r in sess.iterrows():
+        d = pd.to_datetime(r["Fecha"]).strftime("%Y-%m-%d") if pd.notna(r["Fecha"]) else "Sin fecha"
+        micro = "" if pd.isna(r["Microciclo"]) else str(r["Microciclo"])
+        labels.append(f"{d} | {micro if micro else 'Sin día'}")
+    return labels
+
+def _gps_session_list(gps_df, include_matches=False):
+    gps_df = ensure_gps_datetime(gps_df)
+    if gps_df is None or gps_df.empty:
+        return []
+    temp = gps_df.copy()
+    if include_matches:
+        temp = temp[temp["Microciclo"].astype(str).str.upper() == "PARTIDO"]
+        return [pd.to_datetime(d).strftime("%Y-%m-%d") for d in sorted(temp["Fecha"].dropna().unique())]
+    temp = temp[temp["Microciclo"].astype(str).str.upper() != "PARTIDO"]
+    if temp.empty:
+        return []
+    sess = temp[["Fecha","Microciclo"]].drop_duplicates().sort_values(["Fecha","Microciclo"])
+    return [f"{pd.to_datetime(r.Fecha).strftime('%Y-%m-%d')} | {r.Microciclo}" for _, r in sess.iterrows()]
+
+def _overwrite_monitoring_session(session_df, date_str, micro):
+    payload = session_df.copy()
+    payload["Fecha"] = pd.to_datetime(date_str)
+    payload["Microciclo"] = None if micro in [None, "", "Sin día"] else micro
+    delete_fatigue_session(date_str, None if micro in [None, "", "Sin día"] else micro)
+    upsert_monitoring(payload)
+
+def _overwrite_gps_session(session_df, date_str, micro):
+    payload = session_df.copy()
+    payload["Fecha"] = pd.to_datetime(date_str)
+    payload["Microciclo"] = micro
+    if str(micro).upper() == "PARTIDO":
+        delete_gps_match(date_str)
+    else:
+        delete_gps_session(date_str, micro)
+    upsert_gps(payload)
+
+def _detect_duplicate_issues(base_df, gps_df):
+    issues = {"fatigue_duplicates": pd.DataFrame(), "gps_duplicates": pd.DataFrame(), "name_collisions": pd.DataFrame()}
+    if base_df is not None and not base_df.empty:
+        b = base_df.copy()
+        b["Fecha"] = pd.to_datetime(b["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+        key_cols = [c for c in ["Fecha","Microciclo","Jugador"] if c in b.columns]
+        if key_cols:
+            dup = b[b.duplicated(subset=key_cols, keep=False)].sort_values(key_cols)
+            issues["fatigue_duplicates"] = dup
+    if gps_df is not None and not gps_df.empty:
+        g = ensure_gps_datetime(gps_df).copy()
+        g["Fecha"] = pd.to_datetime(g["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+        key_cols = [c for c in ["Fecha","Microciclo","Jugador"] if c in g.columns]
+        if key_cols:
+            dup = g[g.duplicated(subset=key_cols, keep=False)].sort_values(key_cols)
+            issues["gps_duplicates"] = dup
+    return issues
+
+def _fatigue_editor_view(base_df, session_label):
+    if not session_label:
+        return pd.DataFrame(), None, None
+    date_str, micro = [x.strip() for x in session_label.split("|", 1)]
+    micro_val = None if micro == "Sin día" else micro
+    temp = base_df.copy()
+    temp["Fecha"] = pd.to_datetime(temp["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = temp[temp["Fecha"] == date_str].copy()
+    if micro_val is None:
+        df = df[df["Microciclo"].isna() | (df["Microciclo"].astype(str).isin(["", "nan"]))]
+    else:
+        df = df[df["Microciclo"].astype(str) == micro_val]
+    keep_cols = [c for c in ["Jugador","Posicion","Minutos","CMJ","RSI_mod","VMP","sRPE","Observaciones"] if c in df.columns]
+    return df[keep_cols].reset_index(drop=True), date_str, micro_val
+
+def _gps_editor_view(gps_df, session_label, is_match=False):
+    if not session_label:
+        return pd.DataFrame(), None, None
+    if is_match:
+        date_str = session_label
+        micro = "PARTIDO"
+    else:
+        date_str, micro = [x.strip() for x in session_label.split("|", 1)]
+    temp = ensure_gps_datetime(gps_df).copy()
+    temp["Fecha"] = pd.to_datetime(temp["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = temp[(temp["Fecha"] == date_str) & (temp["Microciclo"].astype(str) == micro)].copy()
+    keep_cols = [c for c in ["Jugador","Posicion","time_played","total_distance","hsr","sprints","distance_vrange6","num_acc","num_dec","source_type"] if c in df.columns]
+    return df[keep_cols].reset_index(drop=True), date_str, micro
+
+def page_admin(base_df, gps_df):
+    gps_df = ensure_gps_datetime(gps_df)
+    metrics_df = compute_metrics(base_df) if base_df is not None and not base_df.empty else pd.DataFrame()
+
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: kpi("Registros fatiga", len(base_df), "total")
+    with c2: kpi("Jugadores fatiga", base_df["Jugador"].nunique() if base_df is not None and not base_df.empty else 0, "únicos")
+    with c3:
+        gps_micro = gps_df[gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy() if gps_df is not None and not gps_df.empty else pd.DataFrame()
+        kpi("Sesiones GPS microciclo", len(gps_micro[["Fecha","Microciclo"]].drop_duplicates()) if not gps_micro.empty else 0, "guardadas")
+    with c4:
+        gps_matches = gps_df[gps_df["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy() if gps_df is not None and not gps_df.empty else pd.DataFrame()
+        kpi("Partidos GPS", len(gps_matches["Fecha"].drop_duplicates()) if not gps_matches.empty else 0, "guardados")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Exportación",
+        "Eliminar sesiones",
+        "Editar sesiones",
+        "Sobrescribir desde archivo",
+        "Duplicados / integridad",
+    ])
+
+    with tab1:
+        st.markdown("### Exportación de bases")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if base_df is not None and not base_df.empty:
+                st.download_button("Descargar base fatiga CSV", data=base_df.to_csv(index=False).encode("utf-8"), file_name="fatiga.csv", mime="text/csv")
+        with col2:
+            if gps_df is not None and not gps_df.empty:
+                st.download_button("Descargar base GPS CSV", data=gps_df.to_csv(index=False).encode("utf-8"), file_name="gps.csv", mime="text/csv")
+        with col3:
+            integrated = export_integrated_base(metrics_df, gps_df)
+            if integrated is not None and not integrated.empty:
+                st.download_button("Descargar base integrada CSV", data=integrated.to_csv(index=False).encode("utf-8"), file_name="integrada.csv", mime="text/csv")
+
+        excel_map = {
+            "fatiga": base_df if base_df is not None else pd.DataFrame(),
+            "gps": gps_df if gps_df is not None else pd.DataFrame(),
+            "integrada": export_integrated_base(metrics_df, gps_df),
+        }
+        st.download_button(
+            "Descargar pack completo Excel",
+            data=_to_excel_bytes(excel_map),
+            file_name="bases_monitorizacion.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    with tab2:
+        st.markdown("### Eliminar sesiones guardadas")
+        if base_df is not None and not base_df.empty:
+            st.markdown("#### Control de fatiga")
+            fat_labels = _monitoring_session_list(base_df)
+            if fat_labels:
+                fat_sel = st.selectbox("Selecciona la sesión de fatiga a eliminar", fat_labels, key="adm_del_fat")
+                if st.button("Eliminar sesión de fatiga", type="secondary", key="btn_del_fat_adv"):
+                    date_str, micro = [x.strip() for x in fat_sel.split("|", 1)]
+                    delete_fatigue_session(date_str, None if micro == "Sin día" else micro)
+                    st.success(f"Sesión de fatiga {fat_sel} eliminada correctamente.")
+                    st.rerun()
+
+        if gps_df is not None and not gps_df.empty:
+            st.markdown("#### Sesiones GPS del microciclo")
+            gps_labels = _gps_session_list(gps_df, include_matches=False)
+            if gps_labels:
+                gps_sel = st.selectbox("Selecciona la sesión GPS del microciclo a eliminar", gps_labels, key="adm_del_gps")
+                if st.button("Eliminar sesión GPS microciclo", type="secondary", key="btn_del_gps_adv"):
+                    date_str, micro = [x.strip() for x in gps_sel.split("|", 1)]
+                    delete_gps_session(date_str, micro)
+                    st.success(f"Sesión GPS {gps_sel} eliminada correctamente.")
+                    st.rerun()
+
+            st.markdown("#### Partidos")
+            match_labels = _gps_session_list(gps_df, include_matches=True)
+            if match_labels:
+                sel_match = st.selectbox("Selecciona el partido a eliminar", match_labels, key="adm_del_match")
+                if st.button("Eliminar partido", type="secondary", key="btn_del_match_adv"):
+                    delete_gps_match(sel_match)
+                    st.success(f"Partido {sel_match} eliminado correctamente.")
+                    st.rerun()
+
+    with tab3:
+        st.markdown("### Editar sesiones ya guardadas")
+        subtab_fat, subtab_gps, subtab_match = st.tabs(["Fatiga", "GPS microciclo", "Partidos"])
+        with subtab_fat:
+            fat_labels = _monitoring_session_list(base_df)
+            if fat_labels:
+                fat_sel = st.selectbox("Sesión de fatiga a editar", fat_labels, key="edit_fat_sel")
+                edit_df, date_str, micro = _fatigue_editor_view(base_df, fat_sel)
+                if not edit_df.empty:
+                    edited = st.data_editor(edit_df, use_container_width=True, hide_index=True, num_rows="dynamic", key="edit_fat_editor")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("Guardar cambios sesión fatiga", type="primary", key="save_edit_fat"):
+                            payload = edited.copy()
+                            payload["Fecha"] = pd.to_datetime(date_str)
+                            payload["Microciclo"] = micro
+                            _overwrite_monitoring_session(payload, date_str, micro)
+                            st.success("Sesión de fatiga actualizada.")
+                            st.rerun()
+                    with c2:
+                        st.caption("Se sobrescribe la sesión seleccionada con el contenido editado.")
+            else:
+                st.info("No hay sesiones de fatiga para editar.")
+
+        with subtab_gps:
+            gps_labels = _gps_session_list(gps_df, include_matches=False)
+            if gps_labels:
+                gps_sel = st.selectbox("Sesión GPS del microciclo a editar", gps_labels, key="edit_gps_sel")
+                edit_df, date_str, micro = _gps_editor_view(gps_df, gps_sel, is_match=False)
+                if not edit_df.empty:
+                    edited = st.data_editor(edit_df, use_container_width=True, hide_index=True, num_rows="dynamic", key="edit_gps_editor")
+                    if st.button("Guardar cambios sesión GPS", type="primary", key="save_edit_gps"):
+                        payload = edited.copy()
+                        payload["Fecha"] = pd.to_datetime(date_str)
+                        payload["Microciclo"] = micro
+                        if "source_type" not in payload.columns:
+                            payload["source_type"] = "microcycle"
+                        _overwrite_gps_session(payload, date_str, micro)
+                        st.success("Sesión GPS actualizada.")
+                        st.rerun()
+            else:
+                st.info("No hay sesiones GPS del microciclo para editar.")
+
+        with subtab_match:
+            match_labels = _gps_session_list(gps_df, include_matches=True)
+            if match_labels:
+                match_sel = st.selectbox("Partido a editar", match_labels, key="edit_match_sel")
+                edit_df, date_str, micro = _gps_editor_view(gps_df, match_sel, is_match=True)
+                if not edit_df.empty:
+                    edited = st.data_editor(edit_df, use_container_width=True, hide_index=True, num_rows="dynamic", key="edit_match_editor")
+                    if st.button("Guardar cambios partido", type="primary", key="save_edit_match"):
+                        payload = edited.copy()
+                        payload["Fecha"] = pd.to_datetime(date_str)
+                        payload["Microciclo"] = "PARTIDO"
+                        payload["source_type"] = "match"
+                        _overwrite_gps_session(payload, date_str, "PARTIDO")
+                        st.success("Partido actualizado.")
+                        st.rerun()
+            else:
+                st.info("No hay partidos para editar.")
+
+    with tab4:
+        st.markdown("### Sobrescribir sesiones desde archivo")
+        ov_fat, ov_gps, ov_match = st.tabs(["Fatiga", "GPS microciclo", "Partidos"])
+
+        with ov_fat:
+            fat_labels = _monitoring_session_list(base_df)
+            if fat_labels:
+                fat_sel = st.selectbox("Sesión de fatiga destino", fat_labels, key="ovr_fat_sel")
+                mode = st.radio("Modo de guardado", ["Sobrescribir sesión seleccionada", "Fusionar con sesión seleccionada"], horizontal=True, key="ovr_fat_mode")
+                fat_file = st.file_uploader("Sube archivo de reemplazo para fatiga", type=["xlsx","xls","csv"], key="ovr_fat_file")
+                if fat_file is not None:
+                    parsed = parse_uploaded(fat_file)
+                    date_str, micro = [x.strip() for x in fat_sel.split("|", 1)]
+                    parsed["Fecha"] = pd.to_datetime(date_str)
+                    parsed["Microciclo"] = None if micro == "Sin día" else micro
+                    st.dataframe(parsed[[c for c in ["Fecha","Microciclo","Jugador","Posicion","CMJ","RSI_mod","VMP","sRPE","Observaciones"] if c in parsed.columns]], use_container_width=True, hide_index=True)
+                    if st.button("Guardar archivo en sesión de fatiga", key="btn_ovr_fat"):
+                        if mode.startswith("Sobrescribir"):
+                            _overwrite_monitoring_session(parsed, date_str, None if micro == "Sin día" else micro)
+                        else:
+                            upsert_monitoring(parsed)
+                        st.success("Sesión de fatiga guardada correctamente.")
+                        st.rerun()
+            else:
+                st.info("No hay sesiones de fatiga guardadas para sobrescribir.")
+
+        with ov_gps:
+            gps_labels = _gps_session_list(gps_df, include_matches=False)
+            if gps_labels:
+                gps_sel = st.selectbox("Sesión GPS destino", gps_labels, key="ovr_gps_sel")
+                mode = st.radio("Modo de guardado", ["Sobrescribir sesión seleccionada", "Fusionar con sesión seleccionada"], horizontal=True, key="ovr_gps_mode")
+                gps_file = st.file_uploader("Sube archivo de reemplazo para GPS microciclo", type=["xlsx","xls","csv"], key="ovr_gps_file")
+                if gps_file is not None:
+                    date_str, micro = [x.strip() for x in gps_sel.split("|", 1)]
+                    parsed = parse_gps_uploaded(gps_file, pd.to_datetime(date_str), micro)
+                    st.dataframe(parsed[[c for c in ["Fecha","Microciclo","Jugador","Posicion","time_played","total_distance","hsr","sprints","distance_vrange6","num_acc","num_dec"] if c in parsed.columns]], use_container_width=True, hide_index=True)
+                    if st.button("Guardar archivo en sesión GPS", key="btn_ovr_gps"):
+                        if mode.startswith("Sobrescribir"):
+                            _overwrite_gps_session(parsed, date_str, micro)
+                        else:
+                            upsert_gps(parsed)
+                        st.success("Sesión GPS guardada correctamente.")
+                        st.rerun()
+            else:
+                st.info("No hay sesiones GPS del microciclo guardadas para sobrescribir.")
+
+        with ov_match:
+            match_labels = _gps_session_list(gps_df, include_matches=True)
+            if match_labels:
+                match_sel = st.selectbox("Partido destino", match_labels, key="ovr_match_sel")
+                mode = st.radio("Modo de guardado", ["Sobrescribir partido seleccionado", "Fusionar con partido seleccionado"], horizontal=True, key="ovr_match_mode")
+                match_file = st.file_uploader("Sube archivo de reemplazo para partido", type=["xlsx","xls","csv"], key="ovr_match_file")
+                if match_file is not None:
+                    parsed = parse_gps_uploaded(match_file, pd.to_datetime(match_sel), "PARTIDO")
+                    st.dataframe(parsed[[c for c in ["Fecha","Microciclo","Jugador","Posicion","time_played","total_distance","hsr","sprints","distance_vrange6","num_acc","num_dec"] if c in parsed.columns]], use_container_width=True, hide_index=True)
+                    if st.button("Guardar archivo en partido", key="btn_ovr_match"):
+                        if mode.startswith("Sobrescribir"):
+                            _overwrite_gps_session(parsed, match_sel, "PARTIDO")
+                        else:
+                            upsert_gps(parsed)
+                        st.success("Partido guardado correctamente.")
+                        st.rerun()
+            else:
+                st.info("No hay partidos guardados para sobrescribir.")
+
+    with tab5:
+        st.markdown("### Duplicados e integridad")
+        issues = _detect_duplicate_issues(base_df, gps_df)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### Control de fatiga")
+            if issues["fatigue_duplicates"] is not None and not issues["fatigue_duplicates"].empty:
+                st.error(f"Se han detectado {len(issues['fatigue_duplicates'])} registros potencialmente duplicados.")
+                st.dataframe(issues["fatigue_duplicates"], use_container_width=True, hide_index=True)
+            else:
+                st.success("No se detectan duplicados en la base de fatiga.")
+        with col2:
+            st.markdown("#### GPS")
+            if issues["gps_duplicates"] is not None and not issues["gps_duplicates"].empty:
+                st.error(f"Se han detectado {len(issues['gps_duplicates'])} registros potencialmente duplicados.")
+                st.dataframe(issues["gps_duplicates"], use_container_width=True, hide_index=True)
+            else:
+                st.success("No se detectan duplicados en la base GPS.")
+
+        st.markdown("#### Resumen de integridad")
+        ref_prof = build_match_profile(gps_df) if gps_df is not None and not gps_df.empty else pd.DataFrame()
+        info_lines = [
+            f"Registros fatiga: {0 if base_df is None else len(base_df)}",
+            f"Registros GPS: {0 if gps_df is None else len(gps_df)}",
+            f"Perfiles GPS disponibles: {0 if ref_prof is None or ref_prof.empty else len(ref_prof)}",
+        ]
+        if ref_prof is not None and not ref_prof.empty and "profile_source" in ref_prof.columns:
+            info_lines.append(f"Perfiles propios: {(ref_prof['profile_source'] == 'propio').sum()}")
+            info_lines.append(f"Perfiles por posición: {(ref_prof['profile_source'] != 'propio').sum()}")
+        for line in info_lines:
+            st.caption("• " + line)
+
+
+
+# =========================================================
+# GPS REAL VALUES + WEEKLY GAP + LUPA IA
+# =========================================================
+def _gps_metric_key_from_label(label):
+    reverse = {v: k for k, v in GPS_LABELS.items()}
+    return reverse.get(label, label)
+
+def _gps_fmt(metric_key, val):
+    if pd.isna(val):
+        return "NA"
+    if metric_key in ["sprints", "num_acc", "num_dec"]:
+        return f"{float(val):.0f}"
+    return f"{float(val):.0f}"
+
+def _gps_interpretation_from_status(status):
+    s = str(status).strip().lower()
+    mapping = {
+        "adecuado": "Dentro del rango óptimo",
+        "bajo": "Por debajo del rango óptimo",
+        "alto": "Por encima del rango óptimo",
+        "sin referencia": "Sin referencia suficiente",
+        "sin objetivo": "Sin objetivo definido",
+    }
+    return mapping.get(s, status)
+
+def gps_player_week_table(gps_df, player, any_date):
+    gps_df = ensure_gps_datetime(gps_df)
+    if gps_df.empty:
+        return pd.DataFrame()
+
+    any_date = pd.to_datetime(any_date)
+    start = any_date.normalize() - pd.Timedelta(days=any_date.weekday())
+    end = start + pd.Timedelta(days=6)
+
+    df = gps_df[
+        (gps_df["Jugador"] == player)
+        & (gps_df["Fecha"] >= start)
+        & (gps_df["Fecha"] <= end)
+        & (gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO")
+    ].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    prof = build_match_profile(gps_df)
+    row = df[GPS_METRICS].sum(numeric_only=True)
+    out = pd.DataFrame({"Variable": [GPS_LABELS[m] for m in GPS_METRICS], "metric_key": GPS_METRICS})
+    match_row = prof[prof["Jugador"] == player]
+
+    pcts, mins, maxs, sts, colors, actuals, refs = [], [], [], [], [], [], []
+    tmin_abs, tmax_abs, remaining_to_min, margin_to_max = [], [], [], []
+
+    for m in GPS_METRICS:
+        actual = row[m] if m in row.index else np.nan
+        match_val = match_row[f"{m}_match"].iloc[0] if not match_row.empty else np.nan
+        pct = (actual / match_val * 100) if pd.notna(match_val) and match_val != 0 else np.nan
+        mn, mx = GPS_WEEKLY_TARGETS[m]
+        stt, clr = gps_status_from_pct(pct, mn, mx)
+        target_min_abs = (match_val * mn / 100) if pd.notna(match_val) else np.nan
+        target_max_abs = (match_val * mx / 100) if pd.notna(match_val) else np.nan
+        miss = max(0.0, target_min_abs - actual) if pd.notna(target_min_abs) and pd.notna(actual) else np.nan
+        margin = max(0.0, target_max_abs - actual) if pd.notna(target_max_abs) and pd.notna(actual) else np.nan
+
+        actuals.append(actual)
+        refs.append(match_val)
+        pcts.append(pct)
+        mins.append(mn)
+        maxs.append(mx)
+        sts.append(stt)
+        colors.append(clr)
+        tmin_abs.append(target_min_abs)
+        tmax_abs.append(target_max_abs)
+        remaining_to_min.append(miss)
+        margin_to_max.append(margin)
+
+    out["actual"] = actuals
+    out["match_100"] = refs
+    out["pct"] = pcts
+    out["min"] = mins
+    out["max"] = maxs
+    out["target_min_abs"] = tmin_abs
+    out["target_max_abs"] = tmax_abs
+    out["remaining_to_min_abs"] = remaining_to_min
+    out["margin_to_max_abs"] = margin_to_max
+    out["status"] = sts
+    out["interpretation"] = out["status"].map(_gps_interpretation_from_status)
+    out["color"] = colors
+    return out
+
+def gps_player_session_table(gps_df, player, date_value, micro=None):
+    gps_df = ensure_gps_datetime(gps_df)
+    if gps_df.empty:
+        return pd.DataFrame()
+
+    date_value = pd.to_datetime(date_value).normalize()
+    full_player = gps_df[gps_df["Jugador"] == player].copy()
+    if full_player.empty:
+        return pd.DataFrame()
+
+    full_comp = gps_compute_compliance(full_player, reference_df=gps_df)
+    df = full_comp[full_comp["Fecha"].dt.normalize() == date_value].copy()
+    if micro is not None:
+        df = df[df["Microciclo"] == micro]
+    if df.empty:
+        return pd.DataFrame()
+
+    non_match_df = df[df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy()
+    if not non_match_df.empty:
+        r = non_match_df.sort_values(["Fecha", "Microciclo"]).iloc[-1]
+    else:
+        r = df.sort_values(["Fecha", "Microciclo"]).iloc[-1]
+
+    rows = []
+    targets = GPS_DAILY_TARGETS.get(str(r["Microciclo"]).upper(), {})
+    for m in GPS_METRICS:
+        mn, mx = targets.get(m, (np.nan, np.nan))
+        pct_val = r.get(f"{m}_pct_match", np.nan)
+        actual = r.get(m, np.nan)
+        match_val = np.nan
+        prof = build_match_profile(gps_df)
+        mr = prof[prof["Jugador"] == player]
+        if not mr.empty:
+            match_val = mr[f"{m}_match"].iloc[0]
+        target_min_abs = (match_val * mn / 100) if pd.notna(match_val) and pd.notna(mn) else np.nan
+        target_max_abs = (match_val * mx / 100) if pd.notna(match_val) and pd.notna(mx) else np.nan
+        rows.append({
+            "Variable": GPS_LABELS[m],
+            "metric_key": m,
+            "actual": actual,
+            "match_100": match_val,
+            "pct": pct_val,
+            "min": mn,
+            "max": mx,
+            "target_min_abs": target_min_abs,
+            "target_max_abs": target_max_abs,
+            "remaining_to_min_abs": max(0.0, target_min_abs - actual) if pd.notna(target_min_abs) and pd.notna(actual) else np.nan,
+            "margin_to_max_abs": max(0.0, target_max_abs - actual) if pd.notna(target_max_abs) and pd.notna(actual) else np.nan,
+            "status": r.get(f"{m}_status", "Sin objetivo"),
+            "interpretation": _gps_interpretation_from_status(r.get(f"{m}_status", "Sin objetivo")),
+            "color": r.get(f"{m}_status_color", "#94A3B8"),
+        })
+    return pd.DataFrame(rows)
+
+def gps_week_remaining_table(gps_df, player, any_date):
+    df = gps_player_week_table(gps_df, player, any_date)
+    if df is None or df.empty:
+        return df
+    cols = ["Variable", "actual", "match_100", "pct", "target_min_abs", "target_max_abs", "remaining_to_min_abs", "margin_to_max_abs", "status", "interpretation", "metric_key"]
+    return df[cols].copy()
+
+def team_week_remaining_table(gps_df, any_date, metric_key=None):
+    gps_df = ensure_gps_datetime(gps_df)
+    if gps_df is None or gps_df.empty:
+        return pd.DataFrame()
+    players = sorted(gps_df.loc[gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO", "Jugador"].dropna().unique().tolist())
+    rows = []
+    for player in players:
+        wt = gps_week_remaining_table(gps_df, player, any_date)
+        if wt is None or wt.empty:
+            continue
+        if metric_key is not None:
+            wt = wt[wt["metric_key"] == metric_key]
+        for _, r in wt.iterrows():
+            rows.append({
+                "Jugador": player,
+                "Posición": get_player_position(player, None, gps_df),
+                "Variable": r["Variable"],
+                "Actual": r["actual"],
+                "Referencia 100%": r["match_100"],
+                "% partido": r["pct"],
+                "Objetivo min": r["target_min_abs"],
+                "Objetivo max": r["target_max_abs"],
+                "Faltan para mínimo": r["remaining_to_min_abs"],
+                "Margen hasta máximo": r["margin_to_max_abs"],
+                "Estado": r["status"],
+                "Interpretación": r["interpretation"],
+            })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["Faltan para mínimo"] = pd.to_numeric(out["Faltan para mínimo"], errors="coerce")
+        out = out.sort_values(["Faltan para mínimo","Jugador"], ascending=[False, True], na_position="last")
+    return out
+
+def gps_progress_bars_html(df, title):
+    if df is None or df.empty:
+        return "<div class='section'><div class='title'>" + title + "</div><div class='muted'>Sin datos GPS disponibles.</div></div>"
+    blocks = []
+    for _, r in df.iterrows():
+        pct = np.nan if pd.isna(r["pct"]) else float(r["pct"])
+        width = 0 if pd.isna(pct) else max(0, min(100, pct))
+        metric_key = r.get("metric_key", _gps_metric_key_from_label(r["Variable"]))
+        pct_txt = "Sin referencia" if pd.isna(pct) else f"{pct:.1f}%"
+        actual_txt = _gps_fmt(metric_key, r.get("actual", np.nan))
+        ref_txt = _gps_fmt(metric_key, r.get("match_100", np.nan))
+        tmin_txt = _gps_fmt(metric_key, r.get("target_min_abs", np.nan))
+        tmax_txt = _gps_fmt(metric_key, r.get("target_max_abs", np.nan))
+        remaining_txt = _gps_fmt(metric_key, r.get("remaining_to_min_abs", np.nan))
+        margin_txt = _gps_fmt(metric_key, r.get("margin_to_max_abs", np.nan))
+        blocks.append(
+            f"<div style='margin-bottom:12px;'><div style='display:flex;justify-content:space-between;font-size:13px;'>"
+            f"<span><strong>{r['Variable']}</strong> · {actual_txt} / {ref_txt} ({pct_txt})</span>"
+            f"<span>{r.get('interpretation','')}</span></div>"
+            f"<div style='font-size:12px;color:#667085;margin:3px 0 6px 0;'>Objetivo abs.: {tmin_txt}–{tmax_txt} · Faltan: {remaining_txt} · Margen: {margin_txt}</div>"
+            f"<div style='width:100%;background:#E5E7EB;border-radius:999px;height:12px;overflow:hidden;'><div style='width:{width}%;background:{r['color']};height:12px;'></div></div></div>"
+        )
+    return f"<div class='section'><div class='title'>{title}</div>{''.join(blocks)}</div>"
+
+def gps_progress_bars_streamlit(df, title):
+    st.markdown(f"### {title}")
+    if df is None or df.empty:
+        st.info("Sin datos GPS disponibles.")
+        return
+    for _, r in df.iterrows():
+        pct = 0 if pd.isna(r["pct"]) else float(r["pct"])
+        width = max(0, min(100, pct))
+        metric_key = r.get("metric_key", _gps_metric_key_from_label(r["Variable"]))
+        actual_txt = _gps_fmt(metric_key, r.get("actual", np.nan))
+        ref_txt = _gps_fmt(metric_key, r.get("match_100", np.nan))
+        tmin_txt = _gps_fmt(metric_key, r.get("target_min_abs", np.nan))
+        tmax_txt = _gps_fmt(metric_key, r.get("target_max_abs", np.nan))
+        remaining_txt = _gps_fmt(metric_key, r.get("remaining_to_min_abs", np.nan))
+        margin_txt = _gps_fmt(metric_key, r.get("margin_to_max_abs", np.nan))
+        interp_txt = r.get("interpretation", "")
+        pct_txt = "Sin referencia" if pd.isna(r["pct"]) else f"{float(r['pct']):.1f}%"
+        st.markdown(
+            f"<div style='margin-bottom:12px;'><div style='display:flex;justify-content:space-between;font-size:13px;'>"
+            f"<span><strong>{r['Variable']}</strong> · {actual_txt} / {ref_txt} ({pct_txt})</span><span>{interp_txt}</span></div>"
+            f"<div style='font-size:12px;color:#667085;margin:3px 0 6px 0;'>Objetivo abs.: {tmin_txt}–{tmax_txt} · Faltan: {remaining_txt} · Margen: {margin_txt}</div>"
+            f"<div style='width:100%;background:#E5E7EB;border-radius:999px;height:12px;overflow:hidden;'><div style='width:{width}%;background:{r['color']};height:12px;'></div></div></div>",
+            unsafe_allow_html=True
+        )
+
+def gps_player_report_html(player, gps_df, selected_date):
+    gps_df = ensure_gps_datetime(gps_df)
+    week_df = gps_player_week_table(gps_df, player, selected_date)
+    sess_df = gps_player_session_table(gps_df, player, selected_date)
+    sess_fig = plotly_html(plot_player_gps_support(sess_df, "Apoyo visual GPS de la sesión")) if sess_df is not None and not sess_df.empty else ""
+    week_fig = plotly_html(plot_player_gps_support(week_df, "Apoyo visual GPS semanal")) if week_df is not None and not week_df.empty else ""
+    remaining_html = ""
+    if week_df is not None and not week_df.empty:
+        rem_rows = ""
+        for _, r in week_df.iterrows():
+            mk = r.get("metric_key", _gps_metric_key_from_label(r["Variable"]))
+            rem_rows += f"<tr><td>{r['Variable']}</td><td>{_gps_fmt(mk, r['actual'])}</td><td>{_gps_fmt(mk, r['target_min_abs'])}</td><td>{_gps_fmt(mk, r['remaining_to_min_abs'])}</td></tr>"
+        remaining_html = f"<div class='section'><div class='title'>Qué falta por hacer esta semana</div><table class='report-table'><thead><tr><th>Variable</th><th>Actual</th><th>Objetivo mínimo</th><th>Faltan</th></tr></thead><tbody>{rem_rows}</tbody></table></div>"
+    return f"""
+    <div class='section'><div class='title'>Carga GPS de la sesión</div>{gps_progress_bars_html(sess_df, 'Cumplimiento del día')}{sess_fig}</div>
+    <div class='section'><div class='title'>Carga GPS semanal</div>{gps_progress_bars_html(week_df, 'Acumulado semanal')}{week_fig}</div>
+    {remaining_html}
+    """
+
+def gps_weekly_pdf_story(player, gps_df, selected_date, styles):
+    elems = []
+    week_df = gps_player_week_table(gps_df, player, selected_date)
+    sess_df = gps_player_session_table(gps_df, player, selected_date)
+    if not sess_df.empty:
+        elems.append(Paragraph("Carga GPS de la sesión", styles["SectionDark"]))
+        data = [["Variable","Valor","Ref. 100%","%","Objetivo abs.","Estado"]]
+        for _, r in sess_df.iterrows():
+            mk = r.get("metric_key", _gps_metric_key_from_label(r["Variable"]))
+            data.append([r["Variable"], _gps_fmt(mk, r["actual"]), _gps_fmt(mk, r["match_100"]), f"{r['pct']:.1f}%" if pd.notna(r["pct"]) else "NA", f"{_gps_fmt(mk, r['target_min_abs'])}-{_gps_fmt(mk, r['target_max_abs'])}", r["status"]])
+        t = Table(data, repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#0F172A")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),("FONTSIZE",(0,0),(-1,-1),8.2)]))
+        elems.append(t); elems.append(Spacer(1, 0.18*cm))
+    if not week_df.empty:
+        elems.append(Paragraph("Carga GPS semanal", styles["SectionDark"]))
+        data = [["Variable","Valor","Ref. 100%","%","Objetivo abs.","Faltan","Estado"]]
+        for _, r in week_df.iterrows():
+            mk = r.get("metric_key", _gps_metric_key_from_label(r["Variable"]))
+            data.append([r["Variable"], _gps_fmt(mk, r["actual"]), _gps_fmt(mk, r["match_100"]), f"{r['pct']:.1f}%" if pd.notna(r["pct"]) else "NA", f"{_gps_fmt(mk, r['target_min_abs'])}-{_gps_fmt(mk, r['target_max_abs'])}", _gps_fmt(mk, r["remaining_to_min_abs"]), r["status"]])
+        t = Table(data, repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#0F172A")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),("FONTSIZE",(0,0),(-1,-1),8.2)]))
+        elems.append(t); elems.append(Spacer(1, 0.18*cm))
+    return elems
+
+def _normalize_q(s):
+    import unicodedata
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.lower().strip()
+
+def _metric_from_question(question):
+    q = _normalize_q(question)
+    metric_aliases = {
+        "hsr": ["hsr", "high speed", "alta velocidad"],
+        "sprints": ["sprint", "sprints"],
+        "distance_vrange6": ["distancia sprint", "metros sprint", "distance vrange6"],
+        "num_acc": ["acc", "aceleraciones", "aceleracion"],
+        "num_dec": ["dec", "deceleraciones", "deceleracion"],
+        "total_distance": ["distancia total", "metros totales", "total distance"],
+    }
+    for k, aliases in metric_aliases.items():
+        if any(a in q for a in aliases):
+            return k
+    return None
+
+def _players_from_question(question, metrics_df, gps_df, context_player=None):
+    q = _normalize_q(question)
+    players = sorted(set((metrics_df["Jugador"].dropna().tolist() if metrics_df is not None and not metrics_df.empty else []) + (gps_df["Jugador"].dropna().tolist() if gps_df is not None and not gps_df.empty else [])))
+    hits = []
+    for p in players:
+        pn = _normalize_q(p)
+        if pn in q:
+            hits.append(p)
+    if not hits and context_player:
+        hits = [context_player]
+    return hits
+
+def _team_week_answer(metrics_df, gps_df, week_ws):
+    week_ws = pd.to_datetime(week_ws)
+    week_we = week_ws + pd.Timedelta(days=6)
+    week_fat = metrics_df[(metrics_df["Fecha"] >= week_ws) & (metrics_df["Fecha"] <= week_we)].copy() if metrics_df is not None and not metrics_df.empty else pd.DataFrame()
+    staff = team_staff_table(metrics_df, gps_df, week_ws=week_ws) if "team_staff_table" in globals() else pd.DataFrame()
+    readiness_mean = week_fat["readiness_score"].mean() if not week_fat.empty and "readiness_score" in week_fat.columns else np.nan
+    loss_mean = week_fat["objective_loss_score"].mean() if not week_fat.empty and "objective_loss_score" in week_fat.columns else np.nan
+    critical = int(week_fat["risk_label"].isin(["Fatiga moderada","Fatiga moderada-alta","Fatiga crítica"]).sum()) if not week_fat.empty and "risk_label" in week_fat.columns else 0
+    gps_week_mean = staff["GPS semana %"].mean() if not staff.empty and "GPS semana %" in staff.columns else np.nan
+    lines = []
+    if not staff.empty:
+        top = staff.head(3)
+        top_txt = ", ".join([f"{r['Jugador']} ({r['Decisión']})" for _, r in top.iterrows()])
+        lines.append(f"Los casos más relevantes de la semana son: {top_txt}.")
+    return (
+        f"Estado general del equipo en la semana {week_ws.strftime('%Y-%m-%d')} a {week_we.strftime('%Y-%m-%d')}: "
+        f"readiness media {'NA' if pd.isna(readiness_mean) else f'{readiness_mean:.1f}'}, "
+        f"loss score medio {'NA' if pd.isna(loss_mean) else f'{loss_mean:.2f}'}, "
+        f"GPS semanal medio {'NA' if pd.isna(gps_week_mean) else f'{gps_week_mean:.1f}%'} y "
+        f"{critical} registros en fatiga moderada o superior. "
+        + " ".join(lines)
+    )
+
+def _remaining_metric_answer(gps_df, players, week_ws, metric_key):
+    if not players:
+        return "No he identificado ningún jugador concreto en la pregunta."
+    metric_label = GPS_LABELS.get(metric_key, metric_key)
+    chunks = []
+    for p in players:
+        wt = gps_week_remaining_table(gps_df, p, week_ws)
+        if wt is None or wt.empty:
+            chunks.append(f"{p}: sin datos GPS semanales suficientes.")
+            continue
+        r = wt[wt["metric_key"] == metric_key]
+        if r.empty:
+            chunks.append(f"{p}: no hay datos de {metric_label}.")
+            continue
+        r = r.iloc[0]
+        actual = _gps_fmt(metric_key, r["actual"])
+        ref = _gps_fmt(metric_key, r["match_100"])
+        target_min = _gps_fmt(metric_key, r["target_min_abs"])
+        target_max = _gps_fmt(metric_key, r["target_max_abs"])
+        remaining = _gps_fmt(metric_key, r["remaining_to_min_abs"])
+        pct_txt = "NA" if pd.isna(r["pct"]) else f"{r['pct']:.1f}%"
+        if pd.notna(r["remaining_to_min_abs"]) and float(r["remaining_to_min_abs"]) > 0:
+            chunks.append(f"{p}: lleva {actual} ({pct_txt} del partido; referencia 100% = {ref}). En {metric_label} le faltan {remaining} para llegar al mínimo semanal ({target_min}-{target_max}).")
+        else:
+            margin = _gps_fmt(metric_key, r["margin_to_max_abs"])
+            chunks.append(f"{p}: ya está dentro del rango semanal en {metric_label}. Lleva {actual} ({pct_txt} del partido; referencia 100% = {ref}) y aún tiene margen de {margin} antes del máximo ({target_min}-{target_max}).")
+    return " ".join(chunks)
+
+def _players_below_metric_answer(gps_df, week_ws, metric_key):
+    tbl = team_week_remaining_table(gps_df, week_ws, metric_key=metric_key)
+    if tbl is None or tbl.empty:
+        return "No hay datos GPS semanales suficientes para responder."
+    below = tbl[pd.to_numeric(tbl["Faltan para mínimo"], errors="coerce") > 0]
+    metric_label = GPS_LABELS.get(metric_key, metric_key)
+    if below.empty:
+        return f"Ningún jugador está por debajo del mínimo semanal en {metric_label}."
+    below = below.sort_values("Faltan para mínimo", ascending=False).head(10)
+    pieces = []
+    for _, r in below.iterrows():
+        pieces.append(f"{r['Jugador']} ({_gps_fmt(metric_key, r['Actual'])} actuales, faltan {_gps_fmt(metric_key, r['Faltan para mínimo'])})")
+    return f"Los jugadores más por debajo del mínimo semanal en {metric_label} son: " + ", ".join(pieces) + "."
+
+def _priority_answer(metrics_df, gps_df, week_ws):
+    staff = team_staff_table(metrics_df, gps_df, week_ws=week_ws) if "team_staff_table" in globals() else pd.DataFrame()
+    if staff is None or staff.empty:
+        return "No hay datos suficientes para establecer prioridades esta semana."
+    top = staff.head(5)
+    pieces = []
+    for _, r in top.iterrows():
+        pieces.append(f"{r['Jugador']} ({r['Decisión']}; {r['Observación']})")
+    return "Prioridades de control esta semana: " + ", ".join(pieces) + "."
+
+def answer_lupa_question(question, metrics_df, gps_df, week_ws, context_player=None):
+    q = _normalize_q(question)
+    if q == "":
+        return "Escribe una pregunta. Ejemplos: '¿Cuál es el estado general del equipo esta semana?', '¿Cuánta distancia en HSR le falta a ÁLEX esta semana?', '¿Qué jugadores requieren más control esta semana?'"
+
+    metric_key = _metric_from_question(question)
+    players = _players_from_question(question, metrics_df, gps_df, context_player=context_player)
+
+    if ("estado general" in q) or ("equipo" in q and "semana" in q):
+        return _team_week_answer(metrics_df, gps_df, week_ws)
+
+    if (("falta" in q) or ("faltan" in q) or ("queda" in q) or ("quedan" in q)) and metric_key is not None:
+        if players:
+            return _remaining_metric_answer(gps_df, players, week_ws, metric_key)
+        return _players_below_metric_answer(gps_df, week_ws, metric_key)
+
+    if ("control" in q) or ("prioridad" in q) or ("preocupan" in q) or ("peores" in q):
+        return _priority_answer(metrics_df, gps_df, week_ws)
+
+    if ("quien" in q or "que jugadores" in q) and metric_key is not None:
+        return _players_below_metric_answer(gps_df, week_ws, metric_key)
+
+    return (
+        "No he podido clasificar esa pregunta con suficiente seguridad. "
+        "Prueba con formatos como: "
+        "'¿Cuál es el estado general del equipo esta semana?', "
+        "'¿Cuánta distancia en HSR le falta a ÁLEX esta semana?', "
+        "'¿Qué jugadores están por debajo del mínimo semanal de sprints?', "
+        "'¿Qué jugadores requieren más control esta semana?'"
+    )
+
+def page_lupa_ai(metrics_df, gps_df):
+    st.markdown('<div class="hero"><div style="font-size:0.92rem; opacity:0.9;">Asistente contextual interno</div><div style="font-size:2.05rem; font-weight:900; margin-top:0.15rem;">Lupa IA</div><div style="font-size:1rem; opacity:0.92; margin-top:0.4rem;">Responde preguntas sobre los datos reales cargados en la aplicación.</div></div>', unsafe_allow_html=True)
+    week_labels, week_map = build_week_options(metrics_df, gps_df)
+    if not week_labels:
+        st.info("No hay semanas disponibles.")
+        return
+    wk_label = st.selectbox("Semana de contexto", week_labels, index=len(week_labels)-1, key="lupa_week")
+    week_ws = week_map[wk_label]
+
+    player_map = build_player_display_options(metrics_df, gps_df)
+    player_opts = ["Ninguno"] + list(player_map.keys())
+    context_player_label = st.selectbox("Jugador contextual opcional", player_opts, index=0, key="lupa_player")
+    context_player = None if context_player_label == "Ninguno" else player_map[context_player_label]
+
+    st.caption("Ejemplos: “¿Cuál es el estado general del equipo esta semana?”, “¿Cuánta distancia en HSR le falta a ÁLEX esta semana?”, “¿Qué jugadores requieren más control esta semana?”")
+    question = st.text_area("Pregunta", height=120, key="lupa_question")
+    if st.button("Responder", type="primary", key="lupa_answer_btn"):
+        answer = answer_lupa_question(question, metrics_df, gps_df, week_ws, context_player=context_player)
+        st.markdown("### Respuesta")
+        st.success(answer)
+
+def page_equipo(metrics_df, gps_df):
+    if metrics_df.empty and gps_df.empty:
+        st.info("No hay datos disponibles.")
+        return
+
+    st.markdown('<div class="hero"><div style="font-size:0.92rem; opacity:0.9;">Monitorización neuromuscular + GPS</div><div style="font-size:2.05rem; font-weight:900; margin-top:0.15rem;">Equipo</div><div style="font-size:1rem; opacity:0.92; margin-top:0.4rem;">Lectura integrada semanal y por sesión del grupo.</div></div>', unsafe_allow_html=True)
+
+    week_labels, week_map = build_week_options(metrics_df, gps_df)
+    if not week_labels:
+        st.info("No hay semanas disponibles.")
+        return
+    wk_label = st.selectbox("Semana (lunes-domingo)", week_labels, index=len(week_labels)-1, key="equipo_week_new")
+    week_ws = week_map[wk_label]
+    view_mode = st.radio("Vista", ["Resumen semanal","Sesión concreta"], horizontal=True, key="equipo_view_new")
+
+    gps_df = ensure_gps_datetime(gps_df)
+    week_we = week_ws + pd.Timedelta(days=6)
+    week_fat = metrics_df[(metrics_df["Fecha"] >= week_ws) & (metrics_df["Fecha"] <= week_we)].copy() if not metrics_df.empty else pd.DataFrame()
+    week_gps_raw = gps_df[(gps_df["Fecha"] >= week_ws) & (gps_df["Fecha"] <= week_we) & (gps_df["Microciclo"].astype(str).str.upper() != "PARTIDO")].copy() if not gps_df.empty else pd.DataFrame()
+    week_gps = gps_compute_compliance(week_gps_raw, reference_df=gps_df) if not week_gps_raw.empty else pd.DataFrame()
+
+    if view_mode == "Resumen semanal":
+        summary = weekly_global_summary(metrics_df, gps_df, week_ws)
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: kpi("Sesiones fatiga", summary["fatigue_sessions"], "semana")
+        with c2: kpi("Sesiones GPS", summary["gps_sessions"], "semana")
+        with c3: kpi("Readiness media", "NA" if pd.isna(summary["readiness_mean"]) else f"{summary['readiness_mean']:.1f}", "semana")
+        with c4: kpi("GPS semanal medio", "NA" if pd.isna(summary["gps_compliance_mean"]) else f"{summary['gps_compliance_mean']:.1f}%", "semana")
+        st.info(integrated_week_text(metrics_df, gps_df, week_ws))
+        if not week_fat.empty:
+            a,b = st.columns(2)
+            with a: st.plotly_chart(plot_team_score_trend(week_fat), use_container_width=True)
+            with b: st.plotly_chart(plot_team_risk_distribution(week_fat.groupby("Jugador", as_index=False).last()), use_container_width=True)
+        if not week_gps.empty:
+            st.plotly_chart(plot_team_gps_support(week_gps.groupby("Jugador", as_index=False).agg(compliance_score=("compliance_score","mean"), session_status=("session_status", lambda s: s.iloc[-1]))), use_container_width=True)
+            gps_tbl = week_gps.groupby(["Jugador","Posicion"], as_index=False).agg(**{"GPS semanal %":("compliance_score","mean")})
+            gps_tbl["GPS semanal %"] = gps_tbl["GPS semanal %"].round(1)
+            st.dataframe(gps_tbl.sort_values("GPS semanal %", ascending=False), use_container_width=True, hide_index=True)
+
+        st.markdown("### Qué falta por hacer esta semana")
+        metric_key = st.selectbox("Variable semanal a revisar", GPS_METRICS, format_func=lambda x: GPS_LABELS[x], key="team_gap_metric")
+        gap_tbl = team_week_remaining_table(gps_df, week_ws, metric_key=metric_key)
+        if gap_tbl is not None and not gap_tbl.empty:
+            show = gap_tbl.copy()
+            for c in ["Actual","Referencia 100%","% partido","Objetivo min","Objetivo max","Faltan para mínimo","Margen hasta máximo"]:
+                show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
+            st.dataframe(show, use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay datos suficientes para calcular lo que falta por hacer en la semana.")
+    else:
+        sess_opts = session_options_for_week(metrics_df, gps_df, week_ws)
+        if not sess_opts:
+            st.info("No hay sesiones en esa semana.")
+            return
+        sess_label = st.selectbox("Sesión de la semana", sess_opts, key="equipo_sesion_new")
+        sess_date_str, sess_md = [x.strip() for x in sess_label.split("|", 1)]
+        selected_date = pd.to_datetime(sess_date_str)
+        team_day = week_fat[(week_fat["Fecha"].dt.normalize() == selected_date.normalize()) & (week_fat["Microciclo"].fillna("Sin día").astype(str) == sess_md if sess_md != "Sin día" else week_fat["Fecha"].notna())].copy() if not week_fat.empty else pd.DataFrame()
+        if sess_md == "Sin día" and not week_fat.empty:
+            team_day = week_fat[week_fat["Fecha"].dt.normalize() == selected_date.normalize()].copy()
+        gps_day = week_gps[(week_gps["Fecha"].dt.normalize() == selected_date.normalize()) & (week_gps["Microciclo"].astype(str) == sess_md)].copy() if not week_gps.empty else pd.DataFrame()
+
+        c1,c2,c3,c4,c5 = st.columns(5)
+        with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), sess_md)
+        with c2: kpi("Jugadores fatiga", int(team_day["Jugador"].nunique()) if not team_day.empty else 0, "sesión")
+        with c3: kpi("Readiness media", "NA" if team_day.empty else f"{team_day['readiness_score'].mean():.1f}", "sesión")
+        with c4: kpi("GPS medio", "NA" if gps_day.empty else f"{gps_day['compliance_score'].mean():.1f}%", "sesión")
+        with c5: kpi("Críticos", int((team_day["risk_label"]=="Fatiga crítica").sum()) if not team_day.empty else 0, "sesión")
+
+        if not team_day.empty:
+            st.success(team_interpretation(team_day))
+            a,b = st.columns(2)
+            with a: st.plotly_chart(plot_team_risk_distribution(team_day), use_container_width=True)
+            with b: st.plotly_chart(plot_team_objective_bar(team_day), use_container_width=True)
+            st.plotly_chart(plot_team_decision_matrix(team_day), use_container_width=True)
+
+        if not gps_day.empty:
+            st.markdown("### GPS del día")
+            st.plotly_chart(plot_team_gps_support(gps_day), use_container_width=True)
+            cols = [
+                "Jugador","Posicion","Microciclo","compliance_score","session_status",
+                "hsr","hsr_match_ref","hsr_pct_match",
+                "sprints","sprints_match_ref","sprints_pct_match",
+                "distance_vrange6","distance_vrange6_match_ref","distance_vrange6_pct_match",
+                "num_acc","num_acc_match_ref","num_acc_pct_match",
+                "num_dec","num_dec_match_ref","num_dec_pct_match"
+            ]
+            existing = [c for c in cols if c in gps_day.columns]
+            gps_show = gps_day[existing].copy()
+            rename_map = {
+                "Jugador":"Jugador","Posicion":"Posición","Microciclo":"Día","compliance_score":"Cumplimiento %",
+                "session_status":"Estado",
+                "hsr":"HSR real","hsr_match_ref":"HSR 100%","hsr_pct_match":"HSR %",
+                "sprints":"Sprint real","sprints_match_ref":"Sprint 100%","sprints_pct_match":"Sprint %",
+                "distance_vrange6":"Dist. sprint real","distance_vrange6_match_ref":"Dist. sprint 100%","distance_vrange6_pct_match":"Dist. sprint %",
+                "num_acc":"ACC real","num_acc_match_ref":"ACC 100%","num_acc_pct_match":"ACC %",
+                "num_dec":"DEC real","num_dec_match_ref":"DEC 100%","num_dec_pct_match":"DEC %",
+            }
+            gps_show = gps_show.rename(columns=rename_map)
+            for c in gps_show.columns:
+                if c not in ["Jugador","Posición","Día","Estado"]:
+                    gps_show[c] = pd.to_numeric(gps_show[c], errors="coerce").round(1)
+            st.dataframe(gps_show.sort_values(["Cumplimiento %"], ascending=False, na_position="last"), use_container_width=True, hide_index=True)
+
+def page_jugador(metrics_df, gps_df):
+    if metrics_df.empty and gps_df.empty:
+        st.info("No hay datos disponibles.")
+        return
+    gps_df = ensure_gps_datetime(gps_df)
+    st.markdown('<div class="section-title">Jugador</div>', unsafe_allow_html=True)
+
+    player_map = build_player_display_options(metrics_df, gps_df)
+    player_label = st.selectbox("Selecciona jugador", list(player_map.keys()), key="player_select_new")
+    player = player_map[player_label]
+
+    week_labels, week_map = build_week_options(metrics_df, gps_df, player=player)
+    if not week_labels:
+        st.info("No hay semanas disponibles para este jugador.")
+        return
+    wk_label = st.selectbox("Semana (lunes-domingo)", week_labels, index=len(week_labels)-1, key="player_week_new")
+    week_ws = week_map[wk_label]
+    view_mode = st.radio("Vista", ["Resumen semanal","Sesión concreta"], horizontal=True, key="player_view_new")
+
+    player_df = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha") if not metrics_df.empty else pd.DataFrame()
+    player_gps = gps_df[gps_df["Jugador"] == player].copy() if not gps_df.empty else pd.DataFrame()
+    week_we = week_ws + pd.Timedelta(days=6)
+    player_week_fat = player_df[(player_df["Fecha"] >= week_ws) & (player_df["Fecha"] <= week_we)].copy() if not player_df.empty else pd.DataFrame()
+    player_week_gps_raw = player_gps[(player_gps["Fecha"] >= week_ws) & (player_gps["Fecha"] <= week_we) & (player_gps["Microciclo"].astype(str).str.upper() != "PARTIDO")].copy() if not player_gps.empty else pd.DataFrame()
+    player_week_gps = gps_compute_compliance(player_week_gps_raw, reference_df=gps_df) if not player_week_gps_raw.empty else pd.DataFrame()
+
+    if view_mode == "Resumen semanal":
+        snap = compute_integrated_player_snapshot(player, week_ws, metrics_df, gps_df)
+        st.markdown(f'<div class="card"><div style="font-size:1.7rem; font-weight:900; color:#101828;">{player_label}</div><div style="margin-top:0.55rem;"><span class="pill" style="background:#0F766E;">{snap["integrated_icon"]} {snap["integrated_decision"]}</span></div><div style="margin-top:0.7rem; color:#475467;">{snap["load_response_label"]}</div></div>', unsafe_allow_html=True)
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: kpi("Controles fatiga", int(player_week_fat[["Fecha","Microciclo"]].drop_duplicates().shape[0]) if not player_week_fat.empty else 0, "semana")
+        with c2: kpi("Readiness sem.", "NA" if player_week_fat.empty else f"{player_week_fat['readiness_score'].mean():.1f}", "media")
+        with c3: kpi("GPS sem.", "NA" if player_week_gps.empty else f"{player_week_gps['compliance_score'].mean():.1f}%", "media")
+        with c4: kpi("Carga-respuesta", snap["load_response_label"], "semana")
+        st.plotly_chart(plot_player_integrated_week_dashboard(player, week_ws, metrics_df, gps_df), use_container_width=True)
+        if not player_week_gps.empty:
+            a,b = st.columns(2)
+            week_table = gps_player_week_table(gps_df, player, week_ws)
+            with a:
+                gps_progress_bars_streamlit(week_table, "Cumplimiento GPS semanal")
+            with b:
+                st.plotly_chart(plot_player_gps_support(week_table, "Apoyo visual GPS semanal"), use_container_width=True)
+
+            st.markdown("### Qué falta por hacer esta semana")
+            rem = gps_week_remaining_table(gps_df, player, week_ws).copy()
+            if rem is not None and not rem.empty:
+                show = rem[["Variable","actual","match_100","pct","target_min_abs","target_max_abs","remaining_to_min_abs","margin_to_max_abs","interpretation"]].copy()
+                show.columns = ["Variable","Actual","Referencia 100%","% partido","Objetivo mínimo","Objetivo máximo","Faltan para mínimo","Margen hasta máximo","Interpretación"]
+                for c in ["Actual","Referencia 100%","% partido","Objetivo mínimo","Objetivo máximo","Faltan para mínimo","Margen hasta máximo"]:
+                    show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
+                st.dataframe(show, use_container_width=True, hide_index=True)
+        dist = player_distribution_summary(player_df) if not player_df.empty else {}
+        if dist:
+            d1,d2,d3,d4 = st.columns(4)
+            with d1: kpi("% óptimo", f"{dist.get('Estado óptimo',0):.1f}%", "temporada")
+            with d2: kpi("% leve", f"{dist.get('Fatiga leve',0)+dist.get('Fatiga leve-moderada',0):.1f}%", "temporada")
+            with d3: kpi("% moderada", f"{dist.get('Fatiga moderada',0)+dist.get('Fatiga moderada-alta',0):.1f}%", "temporada")
+            with d4: kpi("% crítica", f"{dist.get('Fatiga crítica',0):.1f}%", "temporada")
+    else:
+        sess_opts = session_options_for_week(metrics_df, gps_df, week_ws, player=player)
+        if not sess_opts:
+            st.info("No hay sesiones en esa semana.")
+            return
+        sess_label = st.selectbox("Sesión de la semana", sess_opts, key="player_sess_new")
+        sess_date_str, sess_md = [x.strip() for x in sess_label.split("|", 1)]
+        selected_date = pd.to_datetime(sess_date_str)
+        current = player_df[player_df["Fecha"].dt.normalize() == selected_date.normalize()] if not player_df.empty else pd.DataFrame()
+        row = current.iloc[-1] if not current.empty else (player_df.iloc[-1] if not player_df.empty else None)
+        snap = compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df)
+        i_alerts = integrated_alerts_for_player(player, selected_date, metrics_df, gps_df)
+
+        if row is not None:
+            risk_color = RISK_COLORS.get(row["risk_label"], "#475467")
+            st.markdown(f'<div class="card"><div style="font-size:1.7rem; font-weight:900; color:#101828;">{player_label}</div><div style="margin-top:0.35rem;">{render_pills(row)}</div><div style="margin-top:0.55rem;"><span class="pill" style="background:{risk_color};">{row["risk_label"]}</span><span class="pill" style="background:#0F766E;">{snap["integrated_icon"]} {snap["integrated_decision"]}</span></div><div style="margin-top:0.7rem; color:#475467;">{player_comment(row)}</div></div>', unsafe_allow_html=True)
+            main_diag, pattern, worst_metric, worst_value = infer_fatigue_profile(row)
+            flags = flags_for_player(player_df, row)
+            all_flags = flags + i_alerts
+            if all_flags: st.warning(" | ".join(all_flags))
+            st.markdown(f"**Diagnóstico:** {main_diag}, con {pattern}. Variable dominante: {LABELS.get(worst_metric, 'NA')} ({'NA' if worst_value is None else f'{worst_value:.1f}%'}). **Decisión operativa:** {row['decision_label']} ({row['availability_label']}). **Integrada:** {snap['integrated_decision']}. **Estabilidad:** {row['objective_cv_label']}. **Contexto:** {snap['context_label']}.")
+            c1,c2,c3,c4,c5,c6,c7,c8 = st.columns(8)
+            with c1: kpi("Fecha", selected_date.strftime("%Y-%m-%d"), sess_md)
+            with c2: kpi("Loss score", f"{row['objective_loss_score']:.2f}", "0-3")
+            with c3: kpi("Pérdida media %", f"{row['objective_loss_mean_pct']:.1f}%", "CMJ + RSI + VMP")
+            with c4: kpi("Readiness", f"{row['readiness_score']:.0f}", "ese mismo día")
+            with c5: kpi("Riesgo", row["risk_label"], "clasificación")
+            with c6: kpi("Decisión", f"{row['decision_icon']} {row['decision_label']}", row["availability_label"])
+            with c7: kpi("Integrada", f"{snap['integrated_icon']} {snap['integrated_decision']}", snap["load_response_label"])
+            with c8: kpi("Alertas sem.", int(snap["weekly_alerts"]), snap["context_label"])
+
+            a,b = st.columns(2)
+            with a: st.plotly_chart(radar_relative_loss(row), use_container_width=True)
+            with b: st.plotly_chart(radar_current_vs_baseline(row), use_container_width=True)
+            c,d = st.columns(2)
+            with c: st.plotly_chart(plot_player_snapshot_compare(row), use_container_width=True)
+            with d: st.plotly_chart(plot_objective_timeline(player_df, selected_date), use_container_width=True)
+
+            st.markdown("### Gráficas principales por variable")
+            for m in OBJECTIVE_METRICS:
+                l, rcol = st.columns(2)
+                with l: st.plotly_chart(plot_metric_main(player_df, m, selected_date), use_container_width=True)
+                with rcol: st.plotly_chart(plot_metric_pct(player_df, m, selected_date), use_container_width=True)
+
+        if not player_gps.empty:
+            st.markdown("## Carga GPS")
+            session_gps = gps_player_session_table(gps_df, player, selected_date, micro=sess_md)
+            gps_progress_bars_streamlit(session_gps, "Cumplimiento GPS del día")
+            st.plotly_chart(plot_player_gps_support(session_gps, "Apoyo visual GPS del día"), use_container_width=True)
+            if not session_gps.empty:
+                sess_tbl = session_gps[["Variable","actual","match_100","pct","target_min_abs","target_max_abs","remaining_to_min_abs","margin_to_max_abs","interpretation"]].copy()
+                sess_tbl.columns = ["Variable","Actual","Referencia 100%","% sesión vs partido","Objetivo mínimo","Objetivo máximo","Faltan para mínimo","Margen hasta máximo","Interpretación"]
+                for c in ["Actual","Referencia 100%","% sesión vs partido","Objetivo mínimo","Objetivo máximo","Faltan para mínimo","Margen hasta máximo"]:
+                    sess_tbl[c] = pd.to_numeric(sess_tbl[c], errors="coerce").round(1)
+                st.dataframe(sess_tbl, use_container_width=True, hide_index=True)
+
+def main():
+    init_db()
+    st.sidebar.markdown("## Staff dashboard")
+    st.sidebar.caption("Versión profesional: decisión integrada, GPS, fatiga, informes y control operativo.")
+    base_df = standardize_player_names_in_frames(load_monitoring())
+    gps_df = standardize_player_names_in_frames(load_gps())
+    metrics_df = compute_metrics(base_df) if not base_df.empty else base_df.copy()
+    globals()["LAST_METRICS_DF"] = metrics_df
+    globals()["LAST_GPS_DF"] = gps_df
+
+    menu = st.sidebar.radio("Sección", ["Cargar datos","Equipo","Jugador","Lupa IA","Informes","Administración"], key="main_menu_v5")
+    if menu == "Cargar datos":
+        page_cargar()
+    elif menu == "Equipo":
+        page_equipo(metrics_df, gps_df)
+    elif menu == "Jugador":
+        page_jugador(metrics_df, gps_df)
+    elif menu == "Lupa IA":
+        page_lupa_ai(metrics_df, gps_df)
     elif menu == "Informes":
         page_informes(metrics_df, gps_df)
     else:
