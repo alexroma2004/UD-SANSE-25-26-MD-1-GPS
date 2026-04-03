@@ -976,6 +976,18 @@ def gps_num(x):
     except Exception:
         return np.nan
 
+
+def gps_distance_km_to_m(series):
+    ser = pd.to_numeric(series, errors="coerce").copy()
+    valid = ser.dropna()
+    if valid.empty:
+        return ser
+    # Si los valores parecen venir en kilómetros (ej. 0.257), convertirlos a metros.
+    # Si ya están en metros (ej. 257), no tocar nada.
+    if valid.max() <= 5:
+        ser = ser * 1000.0
+    return ser
+
 def load_gps():
     supabase = get_supabase()
     try:
@@ -1008,6 +1020,10 @@ def load_gps():
     for c in ["time_played", *GPS_METRICS]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "hsr" in df.columns:
+        df["hsr"] = gps_distance_km_to_m(df["hsr"])
+    if "distance_vrange6" in df.columns:
+        df["distance_vrange6"] = gps_distance_km_to_m(df["distance_vrange6"])
     df["Jugador"] = df["Jugador"].astype(str).map(normalize_player_name)
     return df.sort_values(["Fecha","Microciclo","Jugador"]).reset_index(drop=True)
 
@@ -1106,6 +1122,8 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
         "num_acc": df[acc_col].map(gps_num),
         "num_dec": df[dec_col].map(gps_num),
     })
+    out["hsr"] = gps_distance_km_to_m(out["hsr"])
+    out["distance_vrange6"] = gps_distance_km_to_m(out["distance_vrange6"])
     out["Posicion"] = out["Jugador"].map(POSITION_MAP).fillna("Sin asignar")
     out = out[out["Posicion"] != "Portero"].copy()
     out["source_type"] = "match" if str(microciclo).upper() == "PARTIDO" else "microcycle"
