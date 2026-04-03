@@ -1313,31 +1313,45 @@ def gps_player_session_table(gps_df, player, date_value, micro=None):
     if full_player.empty:
         return pd.DataFrame()
 
-    full_comp = gps_compute_compliance(full_player, reference_df=gps_df)
-    df = full_comp[full_comp["Fecha"].dt.normalize() == date_value].copy()
+    # Tomar solo la sesión concreta del día seleccionado
+    day_df = full_player[full_player["Fecha"].dt.normalize() == date_value].copy()
     if micro is not None:
-        df = df[df["Microciclo"] == micro]
-    if df.empty:
+        day_df = day_df[day_df["Microciclo"].astype(str) == str(micro)]
+    day_df = day_df[day_df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy()
+    if day_df.empty:
         return pd.DataFrame()
 
-    non_match_df = df[df["Microciclo"].astype(str).str.upper() != "PARTIDO"].copy()
-    if not non_match_df.empty:
-        r = non_match_df.sort_values(["Fecha", "Microciclo"]).iloc[-1]
-    else:
-        r = df.sort_values(["Fecha", "Microciclo"]).iloc[-1]
+    # Por seguridad, si hubiese más de un registro del mismo día/microciclo para el jugador,
+    # agregamos los valores de la sesión seleccionada.
+    agg = day_df[GPS_METRICS].sum(numeric_only=True)
+    session_micro = str(day_df["Microciclo"].iloc[-1]).upper()
+
+    prof = build_match_profile(gps_df)
+    match_row = prof[prof["Jugador"] == player]
+    targets = GPS_DAILY_TARGETS.get(session_micro, {})
 
     rows = []
-    targets = GPS_DAILY_TARGETS.get(str(r["Microciclo"]).upper(), {})
     for m in GPS_METRICS:
+        match_val = match_row[f"{m}_match"].iloc[0] if not match_row.empty and f"{m}_match" in match_row.columns else np.nan
+        actual_val = agg.get(m, np.nan)
+        pct_val = (actual_val / match_val * 100) if pd.notna(match_val) and match_val != 0 else np.nan
         mn, mx = targets.get(m, (np.nan, np.nan))
-        pct_val = r.get(f"{m}_pct_match", np.nan)
+        stt, clr = gps_status_from_pct(pct_val, mn, mx)
         rows.append({
             "Variable": GPS_LABELS[m],
+            "metric_key": m,
+            "actual": actual_val,
+            "match_value": match_val,
             "pct": pct_val,
             "min": mn,
             "max": mx,
-            "status": r.get(f"{m}_status", "Sin objetivo"),
-            "color": r.get(f"{m}_status_color", "#94A3B8"),
+            "status": stt,
+            "color": clr,
+            "target_min_value": (match_val * mn / 100.0) if pd.notna(match_val) and pd.notna(mn) else np.nan,
+            "target_max_value": (match_val * mx / 100.0) if pd.notna(match_val) and pd.notna(mx) else np.nan,
+            "remaining_to_min": max(0.0, (match_val * mn / 100.0) - actual_val) if pd.notna(match_val) and pd.notna(mn) and pd.notna(actual_val) else np.nan,
+            "margin_to_max": max(0.0, (match_val * mx / 100.0) - actual_val) if pd.notna(match_val) and pd.notna(mx) and pd.notna(actual_val) else np.nan,
+            "microciclo": session_micro,
         })
     return pd.DataFrame(rows)
 
@@ -3300,8 +3314,22 @@ def page_jugador(metrics_df, gps_df):
         else:
             if session_gps.empty: st.info("Sin GPS del día disponible.")
             else:
-                gps_progress_bars_streamlit(session_gps, "Cumplimiento GPS del día")
-                st.plotly_chart(plot_player_gps_support(session_gps, "Apoyo visual GPS del día"), use_container_width=True)
+                gps_progress_bars_streamlit(session_gps, f"Cumplimiento GPS del día · {sess_md}")
+                st.plotly_chart(plot_player_gps_support(session_gps, f"Apoyo visual GPS del día · {sess_md}"), use_container_width=True)
+                day_show = session_gps[[c for c in ["Variable","actual","match_value","pct","target_min_value","target_max_value","remaining_to_min","margin_to_max","status"] if c in session_gps.columns]].copy()
+                if not day_show.empty:
+                    rename_map = {
+                        "actual":"Valor sesión",
+                        "match_value":"Valor partido (100%)",
+                        "pct":"% sesión vs partido",
+                        "target_min_value":"Objetivo mínimo del día",
+                        "target_max_value":"Objetivo máximo del día",
+                        "remaining_to_min":"Falta para mínimo",
+                        "margin_to_max":"Margen hasta máximo",
+                        "status":"Estado",
+                    }
+                    day_show = day_show.rename(columns=rename_map)
+                    st.dataframe(day_show.round(2), use_container_width=True, hide_index=True)
     with tabs[2]:
         if player_df.empty: st.info("Sin datos longitudinales.")
         else:
