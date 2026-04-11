@@ -6027,5 +6027,945 @@ def main():
     else:
         page_admin(base_df, gps_df)
 
+
+
+# =========================================================
+# MERGE FROM FATIGUE-ONLY APP: FORCE-REACTIVITY + RESULTS
+# =========================================================
+PROFILE_TABLE_NAME = "ud_sanse_player_profiles"
+PLAYER_PROFILES_SQL = """
+create table if not exists public.ud_sanse_player_profiles (
+  jugador text primary key,
+  peso_corporal double precision,
+  carga_sentadilla double precision,
+  updated_at timestamptz default now()
+);
+
+alter table public.ud_sanse_player_profiles enable row level security;
+
+create policy if not exists ud_sanse_player_profiles_select
+on public.ud_sanse_player_profiles
+for select
+using (true);
+
+create policy if not exists ud_sanse_player_profiles_insert
+on public.ud_sanse_player_profiles
+for insert
+with check (true);
+
+create policy if not exists ud_sanse_player_profiles_update
+on public.ud_sanse_player_profiles
+for update
+using (true)
+with check (true);
+
+create policy if not exists ud_sanse_player_profiles_delete
+on public.ud_sanse_player_profiles
+for delete
+using (true);
+
+NOTIFY pgrst, 'reload schema';
+"""
+
+FORCE_PROFILE_COLORS = {
+    "Avión": "#2563EB",
+    "Tanque": "#7C3AED",
+    "Elástico": "#059669",
+    "Base por desarrollar": "#DC2626",
+}
+
+st.markdown("""
+<style>
+.player-card {
+    background: linear-gradient(135deg, #0F172A 0%, #1D4ED8 100%);
+    color: white; border-radius: 24px; padding: 20px 22px; margin-bottom: 12px;
+    box-shadow: 0 16px 36px rgba(15,23,42,0.22);
+}
+.player-card h3 {margin:0; font-size:1.7rem; line-height:1.1;}
+.player-card .sub {opacity:0.9; margin-top:0.25rem; font-size:0.95rem;}
+.player-badge {
+    display:inline-block; padding:6px 12px; border-radius:999px; font-weight:800; font-size:0.82rem;
+    color:white; margin-top:10px; margin-bottom:12px;
+}
+.player-msg {
+    background:#F8FAFC; border:1px solid rgba(15,23,42,0.08); border-radius:16px; padding:14px 16px;
+    color:#0F172A; font-size:0.96rem; line-height:1.45; margin-top:10px;
+}
+.mini-grid {
+    display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; margin-top:12px;
+}
+.mini-stat {
+    background: rgba(255,255,255,0.10); border:1px solid rgba(255,255,255,0.12); border-radius:16px; padding:12px 14px;
+}
+.mini-stat .lab {font-size:0.78rem; opacity:0.85;}
+.mini-stat .val {font-size:1.2rem; font-weight:800; margin-top:2px;}
+.tag-soft {
+    display:inline-block; padding:5px 10px; border-radius:999px; font-weight:700; font-size:0.78rem;
+    background:#EEF2FF; color:#1D4ED8; margin-right:6px; margin-top:4px;
+}
+.summary-strip {
+    display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:14px; margin:8px 0 16px 0;
+}
+.summary-tile {
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(135deg, #0F172A 0%, #1E3A8A 55%, #2563EB 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 22px;
+    padding: 16px 18px 16px 18px;
+    box-shadow: 0 16px 34px rgba(15,23,42,0.18);
+}
+.summary-tile::after {
+    content: "";
+    position: absolute;
+    top: -30px;
+    right: -20px;
+    width: 90px;
+    height: 90px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.10);
+}
+.summary-tile .icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 12px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background: rgba(255,255,255,0.12);
+    font-size: 1rem;
+    margin-bottom: 10px;
+}
+.summary-tile .top {font-size:0.78rem; color:rgba(255,255,255,0.78); font-weight:700;}
+.summary-tile .big {font-size:1.72rem; font-weight:900; color:#FFFFFF; line-height:1.06; margin-top:4px;}
+.summary-tile .sub {font-size:0.84rem; color:rgba(255,255,255,0.84); margin-top:6px; line-height:1.3;}
+.premium-panel {
+    background: linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%);
+    border:1px solid rgba(15,23,42,0.08);
+    border-radius:22px;
+    padding:16px 18px;
+    box-shadow: 0 10px 26px rgba(15,23,42,0.08);
+    margin-bottom:12px;
+}
+.premium-heading {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    font-size:1rem;
+    font-weight:900;
+    color:#0F172A;
+    margin-bottom:12px;
+}
+.premium-heading .dot {
+    width:10px;
+    height:10px;
+    border-radius:999px;
+    background:#2563EB;
+    box-shadow: 0 0 0 6px rgba(37,99,235,0.12);
+}
+.quick-chip {
+    display:inline-block; padding:7px 11px; border-radius:999px; font-weight:800; font-size:0.79rem;
+    margin-right:8px; margin-bottom:8px; color:white; box-shadow: 0 6px 16px rgba(15,23,42,0.10);
+}
+.results-grid {
+    display:grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap:12px; margin:10px 0 14px 0;
+}
+.result-card {
+    background: linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%);
+    border:1px solid rgba(15,23,42,0.08);
+    border-radius:20px;
+    padding:14px 16px;
+    box-shadow: 0 8px 20px rgba(15,23,42,0.06);
+}
+.result-card .lab {font-size:0.78rem; color:#667085; font-weight:700;}
+.result-card .big {font-size:1.5rem; color:#101828; font-weight:900; margin-top:4px; line-height:1.05;}
+.result-card .mini {font-size:0.80rem; color:#475467; margin-top:6px; line-height:1.35;}
+.result-up {color:#15803D; font-weight:800;}
+.result-down {color:#C2410C; font-weight:800;}
+.result-neutral {color:#334155; font-weight:800;}
+.soft-note {
+    background:#EFF6FF;
+    border:1px solid #DBEAFE;
+    color:#1D4ED8;
+    border-radius:16px;
+    padding:12px 14px;
+    font-size:0.9rem;
+    font-weight:700;
+    margin-top:10px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+def load_player_profiles():
+    try:
+        supabase = get_supabase()
+        res = supabase.table(PROFILE_TABLE_NAME).select("*").execute()
+        data = res.data if getattr(res, "data", None) else []
+    except Exception as e:
+        return pd.DataFrame(columns=["Jugador","Peso_corporal","Carga_sentadilla"]), str(e)
+
+    if not data:
+        return pd.DataFrame(columns=["Jugador","Peso_corporal","Carga_sentadilla"]), None
+
+    df = pd.DataFrame(data)
+    rename_map = {
+        "jugador":"Jugador",
+        "peso_corporal":"Peso_corporal",
+        "carga_sentadilla":"Carga_sentadilla",
+        "updated_at":"updated_at",
+    }
+    df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+    keep_cols = [c for c in ["Jugador","Peso_corporal","Carga_sentadilla","updated_at"] if c in df.columns]
+    df = df[keep_cols].copy()
+    if "Jugador" in df.columns:
+        df["Jugador"] = df["Jugador"].astype(str).map(normalize_player_name)
+    for c in ["Peso_corporal","Carga_sentadilla"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df, None
+
+def upsert_player_profiles(df):
+    if df.empty:
+        return
+    supabase = get_supabase()
+    now = pd.Timestamp.now().isoformat(timespec="seconds")
+    rows = []
+    for _, r in df.iterrows():
+        jugador = normalize_player_name(r.get("Jugador", ""))
+        if not jugador:
+            continue
+        peso = pd.to_numeric(r.get("Peso_corporal"), errors="coerce")
+        carga = pd.to_numeric(r.get("Carga_sentadilla"), errors="coerce")
+        rows.append({
+            "jugador": jugador,
+            "peso_corporal": None if pd.isna(peso) else float(peso),
+            "carga_sentadilla": None if pd.isna(carga) else float(carga),
+            "updated_at": now,
+        })
+    if rows:
+        supabase.table(PROFILE_TABLE_NAME).upsert(rows, on_conflict="jugador").execute()
+
+def estimate_pct_1rm_from_vmp(vmp):
+    if pd.isna(vmp):
+        return np.nan
+    pct = 126.3333333333 - 66.6666666667 * float(vmp)
+    return float(np.clip(pct, 30, 100))
+
+def estimate_1rm_from_load_vmp(load_kg, vmp):
+    if pd.isna(load_kg) or pd.isna(vmp) or float(vmp) <= 0:
+        return np.nan
+    pct = estimate_pct_1rm_from_vmp(vmp)
+    if pd.isna(pct) or pct <= 0:
+        return np.nan
+    return float(load_kg) / (pct / 100.0)
+
+def force_reactivity_profile_label(rsi_mod, est_1rm_rel, rsi_ref, rel_ref):
+    if pd.isna(rsi_mod) or pd.isna(est_1rm_rel) or pd.isna(rsi_ref) or pd.isna(rel_ref):
+        return np.nan
+    if rsi_mod >= rsi_ref and est_1rm_rel >= rel_ref:
+        return "Avión"
+    if rsi_mod < rsi_ref and est_1rm_rel >= rel_ref:
+        return "Tanque"
+    if rsi_mod >= rsi_ref and est_1rm_rel < rel_ref:
+        return "Elástico"
+    return "Base por desarrollar"
+
+def build_force_reactivity_df(metrics_df, selected_date):
+    profiles_df, err = load_player_profiles()
+    day_df = metrics_df[metrics_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()].copy()
+    if day_df.empty:
+        return day_df, profiles_df, err, np.nan, np.nan
+    day_df = day_df.sort_values(["Jugador","Fecha"]).groupby("Jugador", as_index=False).tail(1)
+    if profiles_df.empty:
+        merged = day_df.copy()
+        merged["Peso_corporal"] = np.nan
+        merged["Carga_sentadilla"] = np.nan
+    else:
+        merged = day_df.merge(
+            profiles_df[["Jugador","Peso_corporal","Carga_sentadilla"]],
+            on="Jugador", how="left"
+        )
+    merged["est_1rm"] = merged.apply(lambda r: estimate_1rm_from_load_vmp(r.get("Carga_sentadilla"), r.get("VMP")), axis=1)
+    merged["est_1rm_rel"] = np.where(
+        merged["Peso_corporal"].notna() & (merged["Peso_corporal"] > 0),
+        merged["est_1rm"] / merged["Peso_corporal"],
+        np.nan
+    )
+    valid = merged.dropna(subset=["RSI_mod", "est_1rm_rel"]).copy()
+    rsi_ref = valid["RSI_mod"].median() if not valid.empty else np.nan
+    rel_ref = valid["est_1rm_rel"].median() if not valid.empty else np.nan
+    merged["perfil_fr"] = merged.apply(lambda r: force_reactivity_profile_label(r.get("RSI_mod"), r.get("est_1rm_rel"), rsi_ref, rel_ref), axis=1)
+    return merged.sort_values("Jugador"), profiles_df, err, rsi_ref, rel_ref
+
+def plot_force_reactivity_filtered(df, rsi_ref, rel_ref, selected_profiles=None, show_names=True):
+    if selected_profiles:
+        df = df[df["perfil_fr"].isin(selected_profiles)].copy()
+    fig = go.Figure()
+    plot_df = df.dropna(subset=["RSI_mod", "est_1rm_rel"]).copy()
+    if plot_df.empty:
+        fig.update_layout(height=560, title="RSI modificado vs 1RM relativa estimada")
+        return fig
+    for profile_name in ["Avión", "Tanque", "Elástico", "Base por desarrollar"]:
+        sub = plot_df[plot_df["perfil_fr"] == profile_name].copy()
+        if sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=sub["RSI_mod"], y=sub["est_1rm_rel"],
+            mode="markers+text" if show_names else "markers",
+            name=profile_name,
+            text=sub["Jugador"] if show_names else None,
+            textposition="top center",
+            marker=dict(size=13, color=FORCE_PROFILE_COLORS[profile_name], line=dict(color="white", width=1.5)),
+            customdata=np.stack([
+                sub["VMP"].astype(float),
+                sub["Carga_sentadilla"].fillna(np.nan).astype(float),
+                sub["Peso_corporal"].fillna(np.nan).astype(float),
+                sub["est_1rm"].fillna(np.nan).astype(float),
+            ], axis=1),
+            hovertemplate="<b>%{text}</b><br>RSI mod: %{x:.3f}<br>1RM relativa: %{y:.2f} kg/kg<br>VMP: %{customdata[0]:.3f} m/s<br>Carga usada: %{customdata[1]:.1f} kg<br>Peso corporal: %{customdata[2]:.1f} kg<br>1RM estimada: %{customdata[3]:.1f} kg<extra></extra>",
+        ))
+    if pd.notna(rsi_ref):
+        fig.add_vline(x=float(rsi_ref), line_width=2, line_color="#475467")
+    if pd.notna(rel_ref):
+        fig.add_hline(y=float(rel_ref), line_width=2, line_color="#475467")
+    x_min = max(0.10, float(plot_df["RSI_mod"].min()) - 0.05)
+    x_max = float(plot_df["RSI_mod"].max()) + 0.05
+    y_min = max(0.4, float(plot_df["est_1rm_rel"].min()) - 0.15)
+    y_max = float(plot_df["est_1rm_rel"].max()) + 0.15
+    fig.update_xaxes(range=[x_min, x_max], title="RSI modificado")
+    fig.update_yaxes(range=[y_min, y_max], title="1RM relativa estimada (kg/kg)")
+    if pd.notna(rsi_ref) and pd.notna(rel_ref):
+        fig.add_annotation(x=x_max, y=y_max, text="AVIÓN", showarrow=False, xanchor="right", yanchor="top", font=dict(size=13, color=FORCE_PROFILE_COLORS["Avión"]))
+        fig.add_annotation(x=x_min, y=y_max, text="TANQUE", showarrow=False, xanchor="left", yanchor="top", font=dict(size=13, color=FORCE_PROFILE_COLORS["Tanque"]))
+        fig.add_annotation(x=x_max, y=y_min, text="ELÁSTICO", showarrow=False, xanchor="right", yanchor="bottom", font=dict(size=13, color=FORCE_PROFILE_COLORS["Elástico"]))
+        fig.add_annotation(x=x_min, y=y_min, text="BASE POR DESARROLLAR", showarrow=False, xanchor="left", yanchor="bottom", font=dict(size=12, color=FORCE_PROFILE_COLORS["Base por desarrollar"]))
+    fig.update_layout(title="RSI modificado vs 1RM relativa estimada", height=560, margin=dict(l=10, r=10, t=45, b=10), legend_title="Perfil")
+    return fig
+
+def fr_delta_text(value, ref, decimals=2, suffix=""):
+    if pd.isna(value) or pd.isna(ref):
+        return "Sin referencia"
+    delta = value - ref
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta:.{decimals}f}{suffix}"
+
+def force_profile_focus(profile_name):
+    mapping = {
+        "Avión": "Perfil muy completo: combina buena reactividad y buena fuerza relativa. La prioridad es mantener.",
+        "Tanque": "Predomina la fuerza relativa. La pista de mejora está en ganar reactividad y velocidad de expresión.",
+        "Elástico": "Predomina la reactividad. La pista de mejora está en ganar fuerza relativa sin perder frescura.",
+        "Base por desarrollar": "Todavía hay margen claro tanto en reactividad como en fuerza relativa. Conviene un trabajo global."
+    }
+    return mapping.get(profile_name, "Perfil no disponible.")
+
+def build_force_profile_message(row, rsi_ref, rel_ref):
+    profile = row.get("perfil_fr")
+    name = row.get("Jugador", "Jugador")
+    rsi = row.get("RSI_mod")
+    rel = row.get("est_1rm_rel")
+    parts = [f"{name} se sitúa ahora mismo en el perfil **{profile}**."]
+    parts.append(force_profile_focus(profile))
+    if pd.notna(rsi) and pd.notna(rsi_ref):
+        parts.append(
+            f"Su RSI mod ({rsi:.3f}) está {'por encima' if rsi >= rsi_ref else 'por debajo'} de la referencia del grupo ({rsi_ref:.3f})."
+        )
+    if pd.notna(rel) and pd.notna(rel_ref):
+        parts.append(
+            f"Su 1RM relativa estimada ({rel:.2f} kg/kg) está {'por encima' if rel >= rel_ref else 'por debajo'} de la referencia del grupo ({rel_ref:.2f} kg/kg)."
+        )
+    if profile == "Avión":
+        parts.append("Mensaje práctico: mantener la base actual y afinar detalles sin meter fatiga innecesaria.")
+    elif profile == "Tanque":
+        parts.append("Mensaje práctico: priorizar tareas de salto, RSI, stiffness y acciones explosivas de baja pérdida técnica.")
+    elif profile == "Elástico":
+        parts.append("Mensaje práctico: introducir trabajo de fuerza útil para elevar la base sin apagar su componente reactivo.")
+    elif profile == "Base por desarrollar":
+        parts.append("Mensaje práctico: progresión equilibrada de fuerza general, técnica de sentadilla y tareas reactivas básicas.")
+    return " ".join(parts)
+
+def latest_previous_player_row(metrics_df, player, selected_date):
+    if metrics_df.empty:
+        return None
+    dfp = metrics_df[metrics_df["Jugador"] == player].copy()
+    dfp = dfp[dfp["Fecha"].dt.normalize() < pd.to_datetime(selected_date).normalize()]
+    if dfp.empty:
+        return None
+    return dfp.sort_values("Fecha").iloc[-1]
+
+def player_ma3_context(metrics_df, player, selected_date):
+    if metrics_df.empty:
+        return {}
+    dfp = metrics_df[metrics_df["Jugador"] == player].copy()
+    dfp = dfp[dfp["Fecha"].dt.normalize() <= pd.to_datetime(selected_date).normalize()]
+    if dfp.empty:
+        return {}
+    dfp = dfp.sort_values("Fecha").tail(3)
+    out = {}
+    for col in ["RSI_mod", "VMP", "CMJ"]:
+        vals = pd.to_numeric(dfp[col], errors="coerce").dropna()
+        out[f"{col}_ma3"] = vals.mean() if not vals.empty else np.nan
+    return out
+
+def force_profile_priority(profile_name):
+    mapping = {
+        "Avión": "Mantener y afinar",
+        "Tanque": "Potenciar reactividad",
+        "Elástico": "Potenciar fuerza relativa",
+        "Base por desarrollar": "Desarrollo global",
+    }
+    return mapping.get(profile_name, "Sin prioridad definida")
+
+def force_profile_strengths(profile_name):
+    mapping = {
+        "Avión": ("Buena reactividad", "Buena fuerza relativa"),
+        "Tanque": ("Base de fuerza sólida", "Potencial de transferencia alto"),
+        "Elástico": ("Buen componente reactivo", "Expresión neuromuscular interesante"),
+        "Base por desarrollar": ("Margen de mejora amplio", "Perfil muy moldeable"),
+    }
+    return mapping.get(profile_name, ("—", "—"))
+
+def force_profile_score(rsi, rel, rsi_ref, rel_ref):
+    if pd.isna(rsi) or pd.isna(rel) or pd.isna(rsi_ref) or pd.isna(rel_ref) or rsi_ref <= 0 or rel_ref <= 0:
+        return np.nan
+    score = 50 * (rsi / rsi_ref) + 50 * (rel / rel_ref)
+    return float(np.clip(score, 0, 100))
+
+def score_label(score):
+    if pd.isna(score):
+        return "Sin score"
+    if score >= 85:
+        return "Perfil muy completo"
+    if score >= 70:
+        return "Buen perfil"
+    if score >= 55:
+        return "Perfil con margen"
+    return "Perfil por desarrollar"
+
+def compact_delta(curr, prev, decimals=3, suffix=""):
+    if pd.isna(curr) or pd.isna(prev):
+        return "Sin referencia"
+    delta = curr - prev
+    pct = (delta / prev * 100) if prev != 0 else np.nan
+    arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
+    if pd.isna(pct):
+        return f"{arrow} {delta:.{decimals}f}{suffix}"
+    return f"{arrow} {delta:.{decimals}f}{suffix} ({pct:+.1f}%)"
+
+def render_force_profile_card(row, rsi_ref, rel_ref, metrics_df=None, selected_date=None):
+    profile = row.get("perfil_fr", "Perfil no disponible")
+    color = FORCE_PROFILE_COLORS.get(profile, "#334155")
+    rsi = row.get("RSI_mod")
+    rel = row.get("est_1rm_rel")
+    est = row.get("est_1rm")
+    vmp = row.get("VMP")
+    peso = row.get("Peso_corporal")
+    carga = row.get("Carga_sentadilla")
+    player = row.get("Jugador", "Jugador")
+    prev_row = latest_previous_player_row(metrics_df, player, selected_date) if metrics_df is not None and selected_date is not None else None
+    ctx_ma3 = player_ma3_context(metrics_df, player, selected_date) if metrics_df is not None and selected_date is not None else {}
+    prev_rsi = prev_row["RSI_mod"] if prev_row is not None and "RSI_mod" in prev_row else np.nan
+    prev_vmp = prev_row["VMP"] if prev_row is not None and "VMP" in prev_row else np.nan
+    score = force_profile_score(rsi, rel, rsi_ref, rel_ref)
+    strength_1, strength_2 = force_profile_strengths(profile)
+    priority = force_profile_priority(profile)
+    def fnum(x, d=2):
+        return "—" if pd.isna(x) else f"{x:.{d}f}"
+    card = f"""
+    <div class="player-card">
+        <div style="font-size:0.9rem; opacity:0.88;">Tarjeta individual</div>
+        <h3>{player}</h3>
+        <div class="sub">Lectura rápida del perfil fuerza-reactividad en la fecha seleccionada.</div>
+        <div class="player-badge" style="background:{color};">{profile}</div>
+        <div class="mini-grid">
+            <div class="mini-stat"><div class="lab">RSI mod</div><div class="val">{fnum(rsi,3)}</div><div class="lab">vs última: {compact_delta(rsi, prev_rsi, 3)}</div></div>
+            <div class="mini-stat"><div class="lab">1RM relativa</div><div class="val">{fnum(rel,2)} kg/kg</div><div class="lab">vs equipo: {fr_delta_text(rel, rel_ref, 2)}</div></div>
+            <div class="mini-stat"><div class="lab">1RM estimada</div><div class="val">{fnum(est,1)} kg</div><div class="lab">estimación</div></div>
+            <div class="mini-stat"><div class="lab">VMP</div><div class="val">{fnum(vmp,3)} m/s</div><div class="lab">vs última: {compact_delta(vmp, prev_vmp, 3, " m/s")}</div></div>
+        </div>
+    </div>
+    """
+    st.markdown(card, unsafe_allow_html=True)
+    t1, t2 = st.columns(2)
+    with t1:
+        st.markdown(f'<span class="tag-soft">Fortaleza 1: {strength_1}</span>', unsafe_allow_html=True)
+        st.markdown(f'<span class="tag-soft">Fortaleza 2: {strength_2}</span>', unsafe_allow_html=True)
+        st.markdown(f'<span class="tag-soft">Prioridad: {priority}</span>', unsafe_allow_html=True)
+    with t2:
+        tags = []
+        if pd.notna(peso): tags.append(f'<span class="tag-soft">Peso corporal: {peso:.1f} kg</span>')
+        if pd.notna(carga): tags.append(f'<span class="tag-soft">Carga sentadilla: {carga:.1f} kg</span>')
+        if pd.notna(ctx_ma3.get("RSI_mod_ma3", np.nan)): tags.append(f'<span class="tag-soft">RSI MA3: {ctx_ma3["RSI_mod_ma3"]:.3f}</span>')
+        if pd.notna(score): tags.append(f'<span class="tag-soft">Score F-R: {score:.0f}/100 · {score_label(score)}</span>')
+        for tag in tags:
+            st.markdown(tag, unsafe_allow_html=True)
+    st.markdown(f'<div class="player-msg">{build_force_profile_message(row, rsi_ref, rel_ref)}</div>', unsafe_allow_html=True)
+
+def classify_balance_level(rsi, rel, rsi_ref, rel_ref):
+    if pd.isna(rsi) or pd.isna(rel) or pd.isna(rsi_ref) or pd.isna(rel_ref) or rsi_ref <= 0 or rel_ref <= 0:
+        return "Sin clasificar"
+    nr = rsi / rsi_ref
+    nf = rel / rel_ref
+    diff = abs(nr - nf)
+    mean_level = (nr + nf) / 2
+    if diff <= 0.10:
+        if mean_level >= 1.05:
+            return "Equilibrado alto"
+        elif mean_level >= 0.90:
+            return "Equilibrado medio"
+        else:
+            return "Equilibrado bajo"
+    return "Desequilibrado reactivo" if nr > nf else "Desequilibrado fuerza"
+
+def action_priority_label(profile_name, balance_label):
+    if balance_label == "Equilibrado alto":
+        return "Mantener"
+    if balance_label == "Equilibrado medio":
+        return "Ajustar"
+    if balance_label == "Equilibrado bajo":
+        return "Desarrollo global"
+    if profile_name == "Tanque":
+        return "Potenciar reactividad"
+    if profile_name == "Elástico":
+        return "Potenciar fuerza"
+    if profile_name == "Base por desarrollar":
+        return "Desarrollo global"
+    return "Mantener"
+
+def trend_arrow(curr, prev):
+    if pd.isna(curr) or pd.isna(prev):
+        return "—"
+    if curr > prev:
+        return "↑"
+    if curr < prev:
+        return "↓"
+    return "→"
+
+def build_team_force_summary(valid_df, metrics_df, selected_date, rsi_ref, rel_ref):
+    rows = []
+    for _, row in valid_df.iterrows():
+        prev = latest_previous_player_row(metrics_df, row["Jugador"], selected_date)
+        prev_rsi = prev["RSI_mod"] if prev is not None and "RSI_mod" in prev else np.nan
+        prev_est_1rm = np.nan
+        if prev is not None:
+            prev_est_1rm = estimate_1rm_from_load_vmp(row.get("Carga_sentadilla"), prev.get("VMP"))
+        prev_rel = prev_est_1rm / row["Peso_corporal"] if pd.notna(prev_est_1rm) and pd.notna(row.get("Peso_corporal")) and row.get("Peso_corporal") > 0 else np.nan
+        score = force_profile_score(row.get("RSI_mod"), row.get("est_1rm_rel"), rsi_ref, rel_ref)
+        balance_label = classify_balance_level(row.get("RSI_mod"), row.get("est_1rm_rel"), rsi_ref, rel_ref)
+        rows.append({
+            "Jugador": row["Jugador"],
+            "Perfil": row["perfil_fr"],
+            "Equilibrio": balance_label,
+            "Score F-R": round(score, 1) if pd.notna(score) else np.nan,
+            "RSI mod": row["RSI_mod"],
+            "1RM relativa (kg/kg)": row["est_1rm_rel"],
+            "Cambio RSI": trend_arrow(row["RSI_mod"], prev_rsi),
+            "Cambio 1RM rel": trend_arrow(row["est_1rm_rel"], prev_rel),
+            "Prioridad": action_priority_label(row["perfil_fr"], balance_label),
+        })
+    return pd.DataFrame(rows)
+
+def plot_team_priority_bar(team_summary):
+    counts = team_summary["Prioridad"].value_counts().reset_index()
+    counts.columns = ["Prioridad","Jugadores"]
+    fig = px.bar(counts, x="Prioridad", y="Jugadores", text="Jugadores", title="Prioridades de trabajo del grupo")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=320, margin=dict(l=10,r=10,t=45,b=10), xaxis_title="", yaxis_title="Jugadores")
+    return fig
+
+def plot_balance_donut(team_summary):
+    counts = team_summary["Equilibrio"].value_counts().reset_index()
+    counts.columns = ["Equilibrio","Jugadores"]
+    fig = px.pie(counts, names="Equilibrio", values="Jugadores", hole=0.55, title="Distribución del equilibrio del equipo")
+    fig.update_layout(height=320, margin=dict(l=10,r=10,t=45,b=10), legend_title="")
+    return fig
+
+def render_team_summary_tiles(team_summary):
+    if team_summary.empty:
+        return
+    top_score = team_summary.sort_values("Score F-R", ascending=False).iloc[0]
+    top_balance = team_summary[team_summary["Equilibrio"].isin(["Equilibrado alto","Equilibrado medio"])]
+    top_balance_name = top_balance.iloc[0]["Jugador"] if not top_balance.empty else "—"
+    top_priority = team_summary["Prioridad"].value_counts().idxmax() if not team_summary["Prioridad"].empty else "—"
+    mean_score = team_summary["Score F-R"].dropna().mean() if "Score F-R" in team_summary.columns else np.nan
+    html = f"""
+    <div class="summary-strip">
+        <div class="summary-tile"><div class="icon">🏆</div><div class="top">Mejor score global</div><div class="big">{top_score['Jugador']}</div><div class="sub">{top_score['Score F-R']:.0f}/100 · {top_score['Perfil']}</div></div>
+        <div class="summary-tile"><div class="icon">📈</div><div class="top">Media del equipo</div><div class="big">{mean_score:.0f}/100</div><div class="sub">score fuerza-reactividad del grupo</div></div>
+        <div class="summary-tile"><div class="icon">⚖️</div><div class="top">Equilibrio destacado</div><div class="big">{top_balance_name}</div><div class="sub">perfil más consistente del día</div></div>
+        <div class="summary-tile"><div class="icon">🎯</div><div class="top">Prioridad dominante</div><div class="big">{top_priority}</div><div class="sub">tendencia principal del grupo</div></div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+def style_team_summary(df):
+    def color_priority(val):
+        colors = {
+            "Mantener":"background-color: rgba(22,163,74,0.16); color:#166534; font-weight:700;",
+            "Ajustar":"background-color: rgba(59,130,246,0.14); color:#1D4ED8; font-weight:700;",
+            "Potenciar reactividad":"background-color: rgba(124,58,237,0.14); color:#6D28D9; font-weight:700;",
+            "Potenciar fuerza":"background-color: rgba(234,88,12,0.14); color:#C2410C; font-weight:700;",
+            "Desarrollo global":"background-color: rgba(220,38,38,0.14); color:#B91C1C; font-weight:700;",
+        }
+        return colors.get(val, "")
+    def color_profile(val):
+        colors = {
+            "Avión":"background-color: rgba(37,99,235,0.14); color:#1D4ED8; font-weight:700;",
+            "Tanque":"background-color: rgba(124,58,237,0.14); color:#6D28D9; font-weight:700;",
+            "Elástico":"background-color: rgba(5,150,105,0.14); color:#047857; font-weight:700;",
+            "Base por desarrollar":"background-color: rgba(220,38,38,0.14); color:#B91C1C; font-weight:700;",
+        }
+        return colors.get(val, "")
+    def color_balance(val):
+        colors = {
+            "Equilibrado alto":"background-color: rgba(22,163,74,0.14); color:#166534; font-weight:700;",
+            "Equilibrado medio":"background-color: rgba(59,130,246,0.14); color:#1D4ED8; font-weight:700;",
+            "Equilibrado bajo":"background-color: rgba(245,158,11,0.16); color:#B45309; font-weight:700;",
+            "Desequilibrado reactivo":"background-color: rgba(124,58,237,0.14); color:#6D28D9; font-weight:700;",
+            "Desequilibrado fuerza":"background-color: rgba(234,88,12,0.14); color:#C2410C; font-weight:700;",
+        }
+        return colors.get(val, "")
+    styler = df.style.format({
+        "Score F-R":"{:.1f}",
+        "RSI mod":"{:.3f}",
+        "1RM relativa (kg/kg)":"{:.2f}",
+    })
+    if "Perfil" in df.columns:
+        styler = styler.map(color_profile, subset=["Perfil"])
+    if "Equilibrio" in df.columns:
+        styler = styler.map(color_balance, subset=["Equilibrio"])
+    if "Prioridad" in df.columns:
+        styler = styler.map(color_priority, subset=["Prioridad"])
+    return styler
+
+def player_results_reference(player_df, metric):
+    vals = pd.to_numeric(player_df[metric], errors="coerce").dropna()
+    if vals.empty:
+        return {"current": np.nan, "baseline": np.nan, "initial": np.nan, "best": np.nan}
+    current = vals.iloc[-1]
+    baseline_col = f"{metric}_baseline"
+    baseline = pd.to_numeric(player_df[baseline_col], errors="coerce").iloc[-1] if baseline_col in player_df.columns else np.nan
+    initial = vals.iloc[0]
+    best = vals.max()
+    return {"current": current, "baseline": baseline, "initial": initial, "best": best}
+
+def pct_change_safe(current, ref):
+    if pd.isna(current) or pd.isna(ref) or ref == 0:
+        return np.nan
+    return (current - ref) / ref * 100.0
+
+def trend_class(pct):
+    if pd.isna(pct):
+        return "result-neutral", "Sin referencia"
+    if pct > 1.0:
+        return "result-up", f"+{pct:.1f}%"
+    if pct < -1.0:
+        return "result-down", f"{pct:.1f}%"
+    return "result-neutral", f"{pct:.1f}%"
+
+def player_estimated_1rm_series(player_df, load_kg):
+    ser = player_df["VMP"].apply(lambda x: estimate_1rm_from_load_vmp(load_kg, x))
+    return pd.to_numeric(ser, errors="coerce")
+
+def render_results_cards(player_df, load_kg, body_mass=np.nan):
+    refs = {}
+    for metric in OBJECTIVE_METRICS:
+        refs[metric] = player_results_reference(player_df, metric)
+    if pd.notna(load_kg):
+        est_series = player_estimated_1rm_series(player_df, load_kg)
+        refs["1RM_est"] = {
+            "current": est_series.iloc[-1] if not est_series.empty else np.nan,
+            "baseline": est_series.expanding().mean().shift(1).iloc[-1] if len(est_series) > 1 else est_series.mean(),
+            "initial": est_series.dropna().iloc[0] if est_series.dropna().shape[0] else np.nan,
+            "best": est_series.max() if not est_series.empty else np.nan,
+        }
+        if pd.notna(body_mass) and body_mass > 0:
+            rel_series = est_series / body_mass
+            refs["1RM_rel"] = {
+                "current": rel_series.iloc[-1] if not rel_series.empty else np.nan,
+                "baseline": rel_series.expanding().mean().shift(1).iloc[-1] if len(rel_series) > 1 else rel_series.mean(),
+                "initial": rel_series.dropna().iloc[0] if rel_series.dropna().shape[0] else np.nan,
+                "best": rel_series.max() if not rel_series.empty else np.nan,
+            }
+        else:
+            refs["1RM_rel"] = {"current": np.nan, "baseline": np.nan, "initial": np.nan, "best": np.nan}
+    else:
+        refs["1RM_est"] = {"current": np.nan, "baseline": np.nan, "initial": np.nan, "best": np.nan}
+        refs["1RM_rel"] = {"current": np.nan, "baseline": np.nan, "initial": np.nan, "best": np.nan}
+    order = [("CMJ"," cm"), ("RSI_mod",""), ("VMP"," m/s"), ("1RM_est"," kg"), ("1RM_rel"," kg/kg")]
+    labels = {"CMJ":"CMJ", "RSI_mod":"RSI mod", "VMP":"VMP", "1RM_est":"1RM estimada", "1RM_rel":"1RM relativa"}
+    decimals = {"CMJ":1, "RSI_mod":3, "VMP":3, "1RM_est":1, "1RM_rel":2}
+    cards = []
+    for key, suffix in order:
+        ref = refs[key]
+        current = ref["current"]
+        vs_base = pct_change_safe(current, ref["baseline"])
+        vs_initial = pct_change_safe(current, ref["initial"])
+        css_class, txt = trend_class(vs_base)
+        dist_best = pct_change_safe(current, ref["best"])
+        best_text = "—" if pd.isna(ref["best"]) else f"{ref['best']:.{decimals[key]}f}{suffix}"
+        current_text = "—" if pd.isna(current) else f"{current:.{decimals[key]}f}{suffix}"
+        init_text = "—" if pd.isna(vs_initial) else f"{vs_initial:+.1f}%"
+        best_gap = "—" if pd.isna(dist_best) else f"{dist_best:+.1f}%"
+        cards.append(
+            f'<div class="result-card"><div class="lab">{labels[key]}</div><div class="big">{current_text}</div>'
+            f'<div class="mini"><span class="{css_class}">{txt} vs baseline</span></div>'
+            f'<div class="mini">vs inicio: <b>{init_text}</b></div>'
+            f'<div class="mini">mejor marca: <b>{best_text}</b> · distancia: <b>{best_gap}</b></div></div>'
+        )
+    st.markdown('<div class="results-grid">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+
+def results_summary_text(player_df, load_kg=None, body_mass=np.nan):
+    msgs = []
+    for metric in OBJECTIVE_METRICS:
+        ref = player_results_reference(player_df, metric)
+        pct = pct_change_safe(ref["current"], ref["baseline"])
+        if pd.notna(pct):
+            msgs.append((metric, pct))
+    if pd.notna(load_kg):
+        est_series = player_estimated_1rm_series(player_df, load_kg)
+        if not est_series.dropna().empty:
+            baseline = est_series.expanding().mean().shift(1).iloc[-1] if len(est_series) > 1 else est_series.mean()
+            pct = pct_change_safe(est_series.iloc[-1], baseline)
+            if pd.notna(pct):
+                msgs.append(("1RM_est", pct))
+            if pd.notna(body_mass) and body_mass > 0:
+                rel_series = est_series / body_mass
+                rel_base = rel_series.expanding().mean().shift(1).iloc[-1] if len(rel_series) > 1 else rel_series.mean()
+                pct_rel = pct_change_safe(rel_series.iloc[-1], rel_base)
+                if pd.notna(pct_rel):
+                    msgs.append(("1RM_rel", pct_rel))
+    if not msgs:
+        return "Sin datos suficientes para resumir la evolución del jugador."
+    msgs_sorted = sorted(msgs, key=lambda x: x[1], reverse=True)
+    best_metric, best_pct = msgs_sorted[0]
+    worst_metric, worst_pct = msgs_sorted[-1]
+    metric_name = lambda m: {"1RM_est":"1RM estimada","1RM_rel":"1RM relativa"}.get(m, LABELS.get(m,m))
+    return f"Evolución global del jugador: la señal más positiva aparece en {metric_name(best_metric)} ({best_pct:+.1f}% vs baseline). La variable más rezagada es {metric_name(worst_metric)} ({worst_pct:+.1f}% vs baseline)."
+
+def _selected_player_context(metrics_df, gps_df):
+    player_map = build_player_display_options(metrics_df, gps_df)
+    sel_label = st.session_state.get("player_selector_new")
+    if not sel_label or sel_label not in player_map:
+        return None, None, None, None
+    player = player_map[sel_label]
+    player_df = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha") if metrics_df is not None and not metrics_df.empty else pd.DataFrame()
+    if player_df.empty:
+        return player, player_df, None, None
+    view_mode = st.session_state.get("player_view_new", "Sesión concreta")
+    week_labels, week_map = build_week_options(metrics_df, gps_df, player=player)
+    wk_label = st.session_state.get("player_week_new")
+    week_ws = week_map[wk_label] if wk_label in week_map else (week_map[week_labels[-1]] if week_labels else None)
+    selected_date = None
+    sess_md = None
+    if view_mode == "Sesión concreta":
+        sess_label = st.session_state.get("player_sess_new")
+        if sess_label and "|" in sess_label:
+            sess_date_str, sess_md = [x.strip() for x in sess_label.split("|", 1)]
+            selected_date = pd.to_datetime(sess_date_str)
+        else:
+            selected_date = latest_nonmatch_date(player_df, gps_df, player=player) or player_df["Fecha"].max()
+    else:
+        if week_ws is not None:
+            week_we = week_ws + pd.Timedelta(days=6)
+            week_rows = player_df[(player_df["Fecha"] >= week_ws) & (player_df["Fecha"] <= week_we)].copy()
+            selected_date = week_rows["Fecha"].max() if not week_rows.empty else player_df["Fecha"].max()
+        else:
+            selected_date = player_df["Fecha"].max()
+    return player, player_df, pd.to_datetime(selected_date) if selected_date is not None else None, sess_md
+
+def page_force_reactivity(metrics_df, gps_df):
+    if metrics_df.empty:
+        st.info("No hay datos de control de fatiga disponibles.")
+        return
+    st.markdown('<div class="hero"><div style="font-size:0.92rem; opacity:0.9;">Perfil fuerza-reactividad</div><div style="font-size:2.05rem; font-weight:900; margin-top:0.15rem;">RSI mod vs 1RM relativa estimada</div><div style="font-size:1rem; opacity:0.92; margin-top:0.4rem;">Comparación de la reactividad y la fuerza relativa del equipo con perfiles por cuadrantes.</div></div>', unsafe_allow_html=True)
+    dates = sorted(metrics_df["Fecha"].dropna().unique())
+    if not dates:
+        st.info("No hay fechas disponibles.")
+        return
+    opts = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in dates]
+    selected_date = pd.to_datetime(st.selectbox("Fecha de análisis del perfil", opts, index=len(opts)-1, key="fr_date"))
+    fr_df, profiles_df, profiles_err, rsi_ref, rel_ref = build_force_reactivity_df(metrics_df, selected_date)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi("Jugadores del día", fr_df["Jugador"].nunique(), selected_date.strftime("%Y-%m-%d"))
+    valid = fr_df.dropna(subset=["RSI_mod", "est_1rm_rel"]).copy()
+    with c2: kpi("Con perfil calculado", len(valid), "peso + carga completos")
+    with c3: kpi("RSI referencia", f"{rsi_ref:.3f}" if pd.notna(rsi_ref) else "—", "mediana equipo")
+    with c4: kpi("1RM relativa ref.", f"{rel_ref:.2f}" if pd.notna(rel_ref) else "—", "kg/kg mediana")
+
+    if profiles_err:
+        st.warning("La tabla de perfiles de jugador no está disponible todavía. Crea la tabla en Supabase con el SQL del desplegable inferior para poder guardar pesos y cargas.")
+    with st.expander("SQL para crear la tabla de pesos y cargas en Supabase"):
+        st.code(PLAYER_PROFILES_SQL, language="sql")
+
+    missing_body = fr_df[fr_df["Peso_corporal"].isna()]["Jugador"].dropna().tolist() if "Peso_corporal" in fr_df.columns else []
+    missing_load = fr_df[fr_df["Carga_sentadilla"].isna()]["Jugador"].dropna().tolist() if "Carga_sentadilla" in fr_df.columns else []
+    if missing_body or missing_load:
+        msg = []
+        if missing_body:
+            msg.append("sin peso corporal: " + ", ".join(missing_body))
+        if missing_load:
+            msg.append("sin carga de sentadilla: " + ", ".join(missing_load))
+        st.info("Para que el perfil se calcule completo, faltan datos en: " + " · ".join(msg))
+
+    left, right = st.columns([1.55, 1], gap="large")
+    with left:
+        st.markdown('<div class="premium-heading"><span class="dot"></span><span>Scatter colectivo</span></div>', unsafe_allow_html=True)
+        filter_col1, filter_col2 = st.columns([1.5, 1])
+        with filter_col1:
+            selected_profiles = st.multiselect(
+                "Filtrar por perfil",
+                ["Avión", "Tanque", "Elástico", "Base por desarrollar"],
+                default=["Avión", "Tanque", "Elástico", "Base por desarrollar"],
+                key="fr_profiles_filter"
+            )
+        with filter_col2:
+            show_names = st.toggle("Mostrar nombres", value=True, key="fr_show_names")
+        st.markdown('<div class="premium-panel">', unsafe_allow_html=True)
+        st.plotly_chart(plot_force_reactivity_filtered(fr_df, rsi_ref, rel_ref, selected_profiles=selected_profiles, show_names=show_names), use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if not valid.empty:
+            valid["score_fr"] = valid.apply(lambda r: force_profile_score(r.get("RSI_mod"), r.get("est_1rm_rel"), rsi_ref, rel_ref), axis=1)
+            team_summary = build_team_force_summary(valid, metrics_df, selected_date, rsi_ref, rel_ref)
+            st.markdown('<div class="premium-heading"><span class="dot"></span><span>Panel colectivo del equipo</span></div>', unsafe_allow_html=True)
+            sort_by = st.selectbox("Ordenar tabla por", ["Score F-R", "Jugador", "Perfil", "Equilibrio", "Prioridad"], index=0, key="fr_sort_team")
+            ascending = sort_by in ["Jugador", "Perfil", "Equilibrio", "Prioridad"]
+            render_team_summary_tiles(team_summary)
+
+            cvis1, cvis2 = st.columns([1,1], gap="large")
+            with cvis1:
+                st.markdown('<div class="premium-panel">', unsafe_allow_html=True)
+                st.plotly_chart(plot_balance_donut(team_summary), use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+            with cvis2:
+                st.markdown('<div class="premium-panel">', unsafe_allow_html=True)
+                st.plotly_chart(plot_team_priority_bar(team_summary), use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="premium-heading"><span class="dot"></span><span>Tabla-resumen visual</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="premium-panel">', unsafe_allow_html=True)
+            st.dataframe(style_team_summary(team_summary.sort_values(sort_by, ascending=ascending)), use_container_width=True, hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+    with right:
+        st.markdown('<div class="premium-heading"><span class="dot"></span><span>Vista jugador-friendly</span></div>', unsafe_allow_html=True)
+        if valid.empty:
+            st.info("No hay suficientes datos para generar tarjetas individuales.")
+        else:
+            players = valid["Jugador"].dropna().astype(str).sort_values().unique().tolist()
+            selected_player = st.selectbox("Selecciona un jugador", players, index=0, key="fr_player")
+            row = valid[valid["Jugador"] == selected_player].iloc[0]
+            render_force_profile_card(row, rsi_ref, rel_ref, metrics_df=metrics_df, selected_date=selected_date)
+            st.markdown('<div class="premium-heading"><span class="dot"></span><span>Recomendación automática</span></div>', unsafe_allow_html=True)
+            balance_label = classify_balance_level(row.get("RSI_mod"), row.get("est_1rm_rel"), rsi_ref, rel_ref)
+            st.markdown(f'<div class="soft-note">Prioridad principal para <b>{selected_player}</b>: <b>{action_priority_label(row["perfil_fr"], balance_label)}</b>.</div>', unsafe_allow_html=True)
+
+# wrap old pages
+_old_page_jugador = page_jugador
+_old_page_admin = page_admin
+
+def page_jugador(metrics_df, gps_df):
+    _old_page_jugador(metrics_df, gps_df)
+    player, player_df, selected_date, _sess_md = _selected_player_context(metrics_df, gps_df)
+    if player is None or player_df is None or player_df.empty or selected_date is None:
+        return
+
+    profiles_df, _profiles_err = load_player_profiles()
+    load_kg = np.nan
+    body_mass = np.nan
+    if not profiles_df.empty and player in profiles_df["Jugador"].values:
+        prof_row = profiles_df[profiles_df["Jugador"] == player].iloc[0]
+        load_kg = pd.to_numeric(prof_row.get("Carga_sentadilla"), errors="coerce")
+        body_mass = pd.to_numeric(prof_row.get("Peso_corporal"), errors="coerce")
+
+    st.divider()
+    st.markdown("### Resultados de rendimiento")
+    render_results_cards(player_df, load_kg, body_mass=body_mass)
+    st.markdown(f'<div class="soft-note">{results_summary_text(player_df, load_kg, body_mass=body_mass)}</div>', unsafe_allow_html=True)
+
+    fr_df, _profiles, _err, rsi_ref, rel_ref = build_force_reactivity_df(metrics_df, selected_date)
+    if not fr_df.empty and "perfil_fr" in fr_df.columns:
+        player_fr = fr_df[fr_df["Jugador"] == player].copy()
+        if not player_fr.empty:
+            st.markdown("### Perfil fuerza-reactividad")
+            render_force_profile_card(player_fr.iloc[0], rsi_ref, rel_ref, metrics_df=metrics_df, selected_date=selected_date)
+
+def page_admin(base_df, gps_df):
+    st.markdown("### Pesos corporales y cargas de sentadilla")
+    players = sorted(base_df["Jugador"].dropna().astype(str).unique().tolist()) if base_df is not None and not base_df.empty else []
+    profiles_df, profiles_err = load_player_profiles()
+
+    roster = pd.DataFrame({"Jugador": players})
+    if not profiles_df.empty:
+        roster = roster.merge(profiles_df[["Jugador","Peso_corporal","Carga_sentadilla"]], on="Jugador", how="left")
+    else:
+        roster["Peso_corporal"] = np.nan
+        roster["Carga_sentadilla"] = np.nan
+
+    st.caption("Introduce o modifica manualmente el peso corporal y la carga fija usada en sentadilla para estimar la 1RM relativa de cada jugador.")
+    edited_profiles = st.data_editor(
+        roster,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="profiles_editor_merged",
+        column_config={
+            "Jugador": st.column_config.TextColumn("Jugador", disabled=True),
+            "Peso_corporal": st.column_config.NumberColumn("Peso corporal (kg)", min_value=40.0, max_value=130.0, step=0.1, format="%.1f"),
+            "Carga_sentadilla": st.column_config.NumberColumn("Carga sentadilla (kg)", min_value=20.0, max_value=250.0, step=2.5, format="%.1f"),
+        },
+    )
+    c_save1, c_save2 = st.columns([1,1])
+    with c_save1:
+        if st.button("Guardar pesos y cargas", type="primary", key="save_profiles_merged"):
+            try:
+                upsert_player_profiles(edited_profiles)
+                st.success("Pesos y cargas guardados correctamente.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudieron guardar los pesos/cargas: {e}")
+    with c_save2:
+        st.download_button(
+            "Descargar plantilla de pesos/cargas",
+            data=roster.to_csv(index=False).encode("utf-8"),
+            file_name="plantilla_pesos_cargas.csv",
+            mime="text/csv",
+        )
+
+    if profiles_err:
+        st.warning("La tabla de perfiles aún no existe en Supabase. Créala con este SQL y recarga la app.")
+    with st.expander("SQL para crear la tabla de perfiles de peso/carga en Supabase"):
+        st.code(PLAYER_PROFILES_SQL, language="sql")
+
+    st.divider()
+    _old_page_admin(base_df, gps_df)
+
+def main():
+    init_db()
+    st.sidebar.markdown("## Staff dashboard")
+    st.sidebar.caption("Versión profesional: decisión integrada, GPS, fatiga, informes y control operativo.")
+    base_df = standardize_player_names_in_frames(load_monitoring())
+    gps_df = standardize_player_names_in_frames(load_gps())
+    metrics_df = compute_metrics(base_df) if not base_df.empty else base_df.copy()
+    globals()["LAST_METRICS_DF"] = metrics_df
+    globals()["LAST_GPS_DF"] = gps_df
+    menu = st.sidebar.radio("Sección", ["Cargar datos","Equipo","Perfil F-R","Jugador","Comparador","Lupa IA","Informes","Administración"], key="main_menu_merged")
+    if menu == "Cargar datos":
+        page_cargar()
+    elif menu == "Equipo":
+        page_equipo(metrics_df, gps_df)
+    elif menu == "Perfil F-R":
+        page_force_reactivity(metrics_df, gps_df)
+    elif menu == "Jugador":
+        page_jugador(metrics_df, gps_df)
+    elif menu == "Comparador":
+        page_comparador(metrics_df)
+    elif menu == "Lupa IA":
+        page_lupa_ai(metrics_df, gps_df)
+    elif menu == "Informes":
+        page_informes(metrics_df, gps_df)
+    else:
+        page_admin(base_df, gps_df)
+
 if __name__ == "__main__":
     main()
