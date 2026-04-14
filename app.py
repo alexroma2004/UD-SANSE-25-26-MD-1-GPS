@@ -513,8 +513,41 @@ def week_start(date_like):
         return pd.NaT
     return (d - pd.to_timedelta(d.weekday(), unit="D")).normalize()
 
+def _pick_existing_column(df, candidates):
+    if df is None:
+        return None
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _safe_numeric_mean(df, candidates):
+    col = _pick_existing_column(df, candidates)
+    if col is None or df is None or df.empty:
+        return np.nan
+    s = pd.to_numeric(df[col], errors="coerce")
+    return float(s.mean()) if s.notna().any() else np.nan
+
+
+def _safe_label_mode(df, candidates, default="Sin datos"):
+    col = _pick_existing_column(df, candidates)
+    if col is None or df is None or df.empty:
+        return default
+    s = df[col].dropna().astype(str)
+    return s.mode().iloc[0] if not s.empty else default
+
+
+def _safe_alert_count(df, label_candidates, critical_labels):
+    col = _pick_existing_column(df, label_candidates)
+    if col is None or df is None or df.empty:
+        return 0
+    s = df[col].dropna().astype(str)
+    return int(s.isin(critical_labels).sum())
+
+
 def integrated_week_fatigue_summary(metrics_df, selected_date):
-    if metrics_df is None or metrics_df.empty:
+    if metrics_df is None or metrics_df.empty or "Fecha" not in metrics_df.columns:
         return {
             "fatigue_sessions": 0,
             "readiness_mean": np.nan,
@@ -535,18 +568,27 @@ def integrated_week_fatigue_summary(metrics_df, selected_date):
             "moderate_or_worse": 0,
             "critical": 0,
         }
-    by_session = week_df.groupby(["Fecha", "Microciclo"], dropna=False).agg(
-        readiness_score=("readiness_score", "mean"),
-        objective_loss_score=("objective_loss_score", "mean"),
-        mod_or_worse=("risk_label", lambda s: int(pd.Series(s).isin(["Fatiga moderada","Fatiga moderada-alta","Fatiga crítica"]).sum())),
-        critical=("risk_label", lambda s: int((pd.Series(s) == "Fatiga crítica").sum())),
-    ).reset_index()
+
+    readiness_mean = _safe_numeric_mean(week_df, ["readiness_score", "readiness"])
+    loss_mean = _safe_numeric_mean(week_df, ["objective_loss_score", "loss_score", "loss"])
+    mod_or_worse = _safe_alert_count(
+        week_df,
+        ["risk_label", "risk", "estado_fatiga"],
+        {"Fatiga moderada", "Fatiga moderada-alta", "Fatiga crítica"},
+    )
+    critical = _safe_alert_count(
+        week_df,
+        ["risk_label", "risk", "estado_fatiga"],
+        {"Fatiga crítica"},
+    )
+    sessions = week_df[[c for c in ["Fecha", "Microciclo"] if c in week_df.columns]].drop_duplicates().shape[0]
+
     return {
-        "fatigue_sessions": int(len(by_session)),
-        "readiness_mean": float(by_session["readiness_score"].mean()) if len(by_session) else np.nan,
-        "loss_mean": float(by_session["objective_loss_score"].mean()) if len(by_session) else np.nan,
-        "moderate_or_worse": int(by_session["mod_or_worse"].sum()),
-        "critical": int(by_session["critical"].sum()),
+        "fatigue_sessions": int(sessions),
+        "readiness_mean": readiness_mean,
+        "loss_mean": loss_mean,
+        "moderate_or_worse": int(mod_or_worse),
+        "critical": int(critical),
     }
 
 def integrated_week_text(metrics_df, gps_df, selected_date):
@@ -627,74 +669,110 @@ def integrated_decision_from_components(fatigue_risk, base_decision, gps_day_com
     return inv.get(severity, ("Disponible normal","🟢"))
 
 def compute_integrated_player_snapshot(player, selected_date, metrics_df, gps_df):
-    selected_date = pd.to_datetime(selected_date)
-    ws = week_start(selected_date)
-    we = ws + pd.Timedelta(days=6)
     out = {
-        "gps_day_compliance": np.nan,
-        "gps_week_compliance": np.nan,
-        "gps_day_status": "Sin GPS",
-        "gps_week_status": "Sin GPS",
+        "fat_today_readiness": np.nan,
+        "fat_today_loss": np.nan,
+        "fat_today_risk": "Sin datos",
         "fat_week_readiness": np.nan,
         "fat_week_loss": np.nan,
-        "fat_week_sessions": 0,
-        "weekly_alerts": 0,
-        "days_since_match": np.nan,
-        "load_response_label": "Sin información",
-        "integrated_decision": "Sin datos",
-        "integrated_icon": "⚪",
-        "context_label": "Sin contexto competitivo",
+        "fat_week_risk": "Sin datos",
+        "fat_week_alerts": 0,
+        "gps_day_compliance": np.nan,
+        "gps_week_compliance": np.nan,
+        "gps_day_state": "Sin datos",
+        "gps_week_state": "Sin datos",
+        "load_response": "Sin datos",
+        "decision": "Disponible con control",
+        "decision_reason": "Sin suficientes datos",
     }
+    ws = week_start(selected_date)
+    we = ws + pd.Timedelta(days=6)
 
-    if gps_df is not None and not gps_df.empty:
-        gps_df = ensure_gps_datetime(gps_df)
-        p_gps = gps_compute_compliance(gps_df[gps_df["Jugador"] == player].copy(), reference_df=gps_df)
-        day = p_gps[p_gps["Fecha"].dt.normalize() == selected_date.normalize()].copy()
-        if not day.empty and "compliance_score" in day.columns:
-            out["gps_day_compliance"] = float(day["compliance_score"].mean())
-            out["gps_day_status"] = "Adecuado" if 85 <= out["gps_day_compliance"] <= 100 else ("Desviado" if 70 <= out["gps_day_compliance"] <= 115 else "Muy desviado")
-        week = p_gps[(p_gps["Fecha"] >= ws) & (p_gps["Fecha"] <= we) & (p_gps["Microciclo"].astype(str).str.upper() != "PARTIDO")].copy()
-        if not week.empty and "compliance_score" in week.columns:
-            out["gps_week_compliance"] = float(week["compliance_score"].mean())
-            out["gps_week_status"] = "Adecuado" if 85 <= out["gps_week_compliance"] <= 100 else ("Desviado" if 70 <= out["gps_week_compliance"] <= 115 else "Muy desviado")
-            out["weekly_alerts"] += int(((week["compliance_score"] < 70) | (week["compliance_score"] > 115)).sum())
-        matches = p_gps[p_gps["Microciclo"].astype(str).str.upper() == "PARTIDO"].copy()
-        prev_matches = matches[matches["Fecha"] <= selected_date].sort_values("Fecha")
-        if not prev_matches.empty:
-            last_match = prev_matches.iloc[-1]["Fecha"]
-            out["days_since_match"] = int((selected_date.normalize() - pd.to_datetime(last_match).normalize()).days)
-            out["context_label"] = f"{out['days_since_match']} días desde el último partido"
-
-    if metrics_df is not None and not metrics_df.empty:
-        p_fat = metrics_df[metrics_df["Jugador"] == player].copy()
-        p_fat["Fecha"] = pd.to_datetime(p_fat["Fecha"], errors="coerce")
-        week_fat = p_fat[(p_fat["Fecha"] >= ws) & (p_fat["Fecha"] <= we)].copy()
+    if metrics_df is not None and not metrics_df.empty and "Jugador" in metrics_df.columns and "Fecha" in metrics_df.columns:
+        fat = metrics_df.copy()
+        fat["Fecha"] = pd.to_datetime(fat["Fecha"], errors="coerce")
+        player_fat = fat[fat["Jugador"] == player].copy()
+        week_fat = player_fat[(player_fat["Fecha"] >= ws) & (player_fat["Fecha"] <= we)].copy()
         if not week_fat.empty:
-            out["fat_week_readiness"] = float(week_fat["readiness_score"].mean())
-            out["fat_week_loss"] = float(week_fat["objective_loss_score"].mean())
-            out["fat_week_sessions"] = int(week_fat[["Fecha","Microciclo"]].drop_duplicates().shape[0])
-            out["weekly_alerts"] += int(week_fat["risk_label"].isin(["Fatiga moderada","Fatiga moderada-alta","Fatiga crítica"]).sum())
-        day_fat = p_fat[p_fat["Fecha"].dt.normalize() == selected_date.normalize()].copy()
-        if not day_fat.empty:
-            r = day_fat.iloc[-1]
-            dec, icon = integrated_decision_from_components(
-                r.get("risk_label","Buen estado"),
-                r.get("decision_label","Disponible normal"),
-                out["gps_day_compliance"],
-                out["gps_week_compliance"],
-                r.get("readiness_score", np.nan),
-                out["weekly_alerts"],
+            last_row = week_fat.sort_values("Fecha").iloc[-1]
+            readiness_col = _pick_existing_column(week_fat, ["readiness_score", "readiness"])
+            loss_col = _pick_existing_column(week_fat, ["objective_loss_score", "loss_score", "loss"])
+            risk_col = _pick_existing_column(week_fat, ["risk_label", "risk", "estado_fatiga"])
+
+            out["fat_week_readiness"] = _safe_numeric_mean(week_fat, ["readiness_score", "readiness"])
+            out["fat_week_loss"] = _safe_numeric_mean(week_fat, ["objective_loss_score", "loss_score", "loss"])
+            out["fat_week_risk"] = _safe_label_mode(week_fat, ["risk_label", "risk", "estado_fatiga"], default="Sin datos")
+            out["fat_week_alerts"] = _safe_alert_count(
+                week_fat,
+                ["risk_label", "risk", "estado_fatiga"],
+                {"Fatiga moderada", "Fatiga moderada-alta", "Fatiga crítica"},
             )
-            out["integrated_decision"] = dec
-            out["integrated_icon"] = icon
-            out["load_response_label"] = integrated_load_response_label(out["gps_day_compliance"], out["gps_week_compliance"], r.get("readiness_score", np.nan), r.get("objective_loss_score", np.nan))
-        elif pd.notna(out["fat_week_readiness"]):
-            dec, icon = integrated_decision_from_components(
-                "Buen estado", "Disponible normal", out["gps_day_compliance"], out["gps_week_compliance"], out["fat_week_readiness"], out["weekly_alerts"]
-            )
-            out["integrated_decision"] = dec
-            out["integrated_icon"] = icon
-            out["load_response_label"] = integrated_load_response_label(out["gps_day_compliance"], out["gps_week_compliance"], out["fat_week_readiness"], out["fat_week_loss"])
+
+            if readiness_col is not None:
+                val = pd.to_numeric(pd.Series([last_row.get(readiness_col)]), errors="coerce").iloc[0]
+                out["fat_today_readiness"] = float(val) if pd.notna(val) else np.nan
+            if loss_col is not None:
+                val = pd.to_numeric(pd.Series([last_row.get(loss_col)]), errors="coerce").iloc[0]
+                out["fat_today_loss"] = float(val) if pd.notna(val) else np.nan
+            if risk_col is not None:
+                out["fat_today_risk"] = str(last_row.get(risk_col, "Sin datos"))
+
+    if gps_df is not None and not gps_df.empty and "Jugador" in gps_df.columns and "Fecha" in gps_df.columns:
+        gps = ensure_gps_datetime(gps_df.copy())
+        player_gps = gps[gps["Jugador"] == player].copy()
+        week_gps = player_gps[(player_gps["Fecha"] >= ws) & (player_gps["Fecha"] <= we)].copy()
+        if not week_gps.empty:
+            week_comp = gps_compute_compliance(week_gps.copy(), reference_df=gps)
+            if not week_comp.empty:
+                if "compliance_score" in week_comp.columns:
+                    comp_mean = pd.to_numeric(week_comp["compliance_score"], errors="coerce").mean()
+                    out["gps_week_compliance"] = float(comp_mean) if pd.notna(comp_mean) else np.nan
+                if "status" in week_comp.columns and week_comp["status"].notna().any():
+                    out["gps_week_state"] = week_comp["status"].astype(str).mode().iloc[0]
+                last_gps_day = week_comp.sort_values("Fecha").iloc[-1]
+                if "compliance_score" in week_comp.columns:
+                    day_comp = pd.to_numeric(pd.Series([last_gps_day.get("compliance_score")]), errors="coerce").iloc[0]
+                    out["gps_day_compliance"] = float(day_comp) if pd.notna(day_comp) else np.nan
+                if "status" in week_comp.columns:
+                    out["gps_day_state"] = str(last_gps_day.get("status", "Sin datos"))
+
+    ref_readiness = out["fat_today_readiness"] if pd.notna(out["fat_today_readiness"]) else out["fat_week_readiness"]
+    ref_loss = out["fat_today_loss"] if pd.notna(out["fat_today_loss"]) else out["fat_week_loss"]
+    fatigue_risk = out["fat_today_risk"] if out["fat_today_risk"] != "Sin datos" else out["fat_week_risk"]
+
+    base_decision = compute_integrated_decision(
+        fatigue_risk,
+        out["gps_day_compliance"],
+        out["gps_week_compliance"],
+        ref_readiness,
+        ref_loss,
+        out["fat_week_alerts"],
+    )
+    final_decision = integrated_decision_from_components(
+        fatigue_risk,
+        base_decision,
+        out["gps_day_compliance"],
+        out["gps_week_compliance"],
+        ref_readiness,
+        weekly_alerts=out["fat_week_alerts"],
+    )
+    out["load_response"] = integrated_load_response_label(
+        out["gps_day_compliance"], out["gps_week_compliance"], ref_readiness, ref_loss
+    )
+    out["decision"] = final_decision
+    reasons = []
+    if fatigue_risk not in ["Sin datos", "Fatiga baja"]:
+        reasons.append(fatigue_risk)
+    if pd.notna(out["gps_week_compliance"]):
+        if out["gps_week_compliance"] < 60:
+            reasons.append("GPS semanal bajo")
+        elif out["gps_week_compliance"] > 115:
+            reasons.append("GPS semanal alto")
+    if pd.notna(ref_readiness) and ref_readiness < 60:
+        reasons.append("Readiness bajo")
+    if pd.notna(ref_loss) and ref_loss >= 1.5:
+        reasons.append("Loss score alto")
+    out["decision_reason"] = " + ".join(reasons) if reasons else "Situación estable"
     return out
 
 def integrated_alerts_for_player(player, selected_date, metrics_df, gps_df):
