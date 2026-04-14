@@ -216,12 +216,19 @@ def get_player_position(player, metrics_df=None, gps_df=None):
     return "Sin asignar"
 
 def build_player_display_options(metrics_df, gps_df):
-    players = sorted(set((metrics_df["Jugador"].dropna().unique().tolist() if metrics_df is not None and not metrics_df.empty else []) + (gps_df["Jugador"].dropna().unique().tolist() if gps_df is not None and not gps_df.empty else [])))
+    def _player_values(df):
+        if df is None or df.empty:
+            return []
+        for col in ["Jugador", "jugador", "player", "Player", "name", "Name"]:
+            if col in df.columns:
+                return df[col].dropna().astype(str).unique().tolist()
+        return []
+
+    players = sorted(set(_player_values(metrics_df) + _player_values(gps_df)))
     labels = {}
     for p in players:
         labels[f"{p} - {get_player_position(p, metrics_df, gps_df).upper()}"] = p
     return labels
-
 def build_week_options(metrics_df=None, gps_df=None, player=None):
     dates = []
     if metrics_df is not None and not metrics_df.empty:
@@ -1036,15 +1043,31 @@ def normalize_gps_columns(df):
 def load_gps():
     supabase = get_supabase()
     try:
-        response = supabase.table(SUPABASE_GPS_TABLE).select("*").execute()
-        rows = response.data if getattr(response, "data", None) else []
-        if not rows:
-            return pd.DataFrame(columns=["Fecha", "Jugador", "Posicion", "Microciclo", "total_distance", "hsr", "distance_vrange6", "sprints", "num_acc", "num_dec", "time"])
-        df = ensure_gps_datetime(pd.DataFrame(rows))
+        res = supabase.table(SUPABASE_GPS_TABLE).select("*").execute()
+        data = res.data if getattr(res, "data", None) else []
+        df = pd.DataFrame(data)
+        if df.empty:
+            return pd.DataFrame(columns=["Fecha", "Jugador", "Posicion", "Microciclo", "distance", "hsr", "sprints", "distance_vrange6", "accels", "decels"])
+        rename_map = {
+            "fecha": "Fecha",
+            "jugador": "Jugador",
+            "posicion": "Posicion",
+            "microciclo": "Microciclo",
+            "session_type": "session_type",
+            "distance": "distance",
+            "hsr": "hsr",
+            "sprints": "sprints",
+            "distance_vrange6": "distance_vrange6",
+            "accels": "accels",
+            "decels": "decels",
+            "valid_match": "valid_match",
+            "minutes": "minutes",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         return normalize_gps_columns(df)
     except Exception as e:
-        st.warning(f"No se pudo cargar GPS desde Supabase: {e}")
-        return pd.DataFrame(columns=["Fecha", "Jugador", "Posicion", "Microciclo", "total_distance", "hsr", "distance_vrange6", "sprints", "num_acc", "num_dec", "time"])
+        st.error(f"Error cargando GPS desde Supabase: {e}")
+        return pd.DataFrame(columns=GPS_DB_COLUMNS)
 def upsert_gps(df):
     if df.empty:
         return
