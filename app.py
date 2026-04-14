@@ -7008,5 +7008,669 @@ def main():
     else:
         page_admin(base_df, gps_df)
 
+
+# =========================================================
+# PATCH · PRE/POST intra-sesión + baseline solo MD-4 a MD-1
+# =========================================================
+import json
+import io
+
+BASELINE_ALLOWED_DAYS = {"MD-4", "MD-3", "MD-2", "MD-1"}
+OBS_META_MARKER = "__APPMETA__"
+
+_prev_page_equipo = page_equipo
+_prev_page_jugador = page_jugador
+_prev_parse_uploaded_fatigue = parse_uploaded_fatigue
+
+
+def normalize_microcycle_label(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value).strip().upper()
+    s = s.replace(" ", "")
+    s = s.replace("–", "-").replace("—", "-")
+    s = s.replace("MD+1", "MD+1")
+    s = s.replace("MDPLUS1", "MD+1")
+    s = s.replace("MD1", "MD-1") if s == "MD1" else s
+    return s
+
+
+def is_baseline_day(value):
+    return normalize_microcycle_label(value) in BASELINE_ALLOWED_DAYS
+
+
+def _safe_float(value):
+    if value is None:
+        return np.nan
+    if isinstance(value, str):
+        v = value.strip().replace("%", "")
+        if v == "":
+            return np.nan
+        v = v.replace(",", ".")
+        try:
+            return float(v)
+        except Exception:
+            return np.nan
+    try:
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def _clean_obs_and_meta(obs_text):
+    if obs_text is None or (isinstance(obs_text, float) and pd.isna(obs_text)):
+        return "", {}
+    txt = str(obs_text)
+    if OBS_META_MARKER not in txt:
+        return txt, {}
+    note, meta_part = txt.split(OBS_META_MARKER, 1)
+    note = note.strip()
+    try:
+        meta = json.loads(meta_part.strip()) if meta_part.strip() else {}
+    except Exception:
+        meta = {}
+    return note, meta if isinstance(meta, dict) else {}
+
+
+def _compose_obs(note, meta):
+    note = "" if note is None or (isinstance(note, float) and pd.isna(note)) else str(note).strip()
+    meta = {k: v for k, v in (meta or {}).items() if v is not None and not (isinstance(v, float) and pd.isna(v))}
+    if not meta:
+        return note
+    payload = OBS_META_MARKER + json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+    return f"{note}\n{payload}" if note else payload
+
+
+def _ensure_prepost_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy() if df is not None else pd.DataFrame()
+    for col in ["CMJ_POST", "RSI_MOD_POST", "OBS_NOTE"]:
+        if col not in out.columns:
+            out[col] = np.nan if col != "OBS_NOTE" else ""
+    if "Observaciones" not in out.columns:
+        out["Observaciones"] = ""
+    if out.empty:
+        return out
+    notes = []
+    cmj_post = []
+    rsi_post = []
+    for obs in out["Observaciones"].tolist():
+        note, meta = _clean_obs_and_meta(obs)
+        notes.append(note)
+        cmj_post.append(_safe_float(meta.get("cmj_post")))
+        rsi_post.append(_safe_float(meta.get("rsi_mod_post")))
+    out["OBS_NOTE"] = notes
+    if "CMJ_POST" in out.columns:
+        out["CMJ_POST"] = pd.to_numeric(out["CMJ_POST"], errors="coerce").fillna(pd.Series(cmj_post, index=out.index))
+    else:
+        out["CMJ_POST"] = pd.Series(cmj_post, index=out.index)
+    if "RSI_MOD_POST" in out.columns:
+        out["RSI_MOD_POST"] = pd.to_numeric(out["RSI_MOD_POST"], errors="coerce").fillna(pd.Series(rsi_post, index=out.index))
+    else:
+        out["RSI_MOD_POST"] = pd.Series(rsi_post, index=out.index)
+    out["CMJ_POST"] = pd.to_numeric(out["CMJ_POST"], errors="coerce")
+    out["RSI_MOD_POST"] = pd.to_numeric(out["RSI_MOD_POST"], errors="coerce")
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def load_monitoring():
+    supabase = get_supabase()
+    try:
+        res = supabase.table(SUPABASE_MONITORING_TABLE).select("*").execute()
+        data = res.data if getattr(res, "data", None) else []
+    except Exception:
+        return _ensure_prepost_columns(pd.DataFrame(columns=[
+            "Fecha","Jugador","Microciclo","Posicion","CMJ","RSI_mod","VMP","sRPE","Observaciones","CMJ_POST","RSI_MOD_POST"
+        ]))
+    df = pd.DataFrame(data)
+    if df.empty:
+        return _ensure_prepost_columns(pd.DataFrame(columns=[
+            "Fecha","Jugador","Microciclo","Posicion","CMJ","RSI_mod","VMP","sRPE","Observaciones","CMJ_POST","RSI_MOD_POST"
+        ]))
+    if "fecha" in df.columns and "Fecha" not in df.columns:
+        df["Fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+    elif "Fecha" in df.columns:
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.date
+    else:
+        df["Fecha"] = pd.NaT
+    rename_map = {
+        "jugador": "Jugador",
+        "microciclo": "Microciclo",
+        "posicion": "Posicion",
+        "cmj": "CMJ",
+        "rsi_mod": "RSI_mod",
+        "vmp": "VMP",
+        "srpe": "sRPE",
+        "observaciones": "Observaciones",
+    }
+    for old, new in rename_map.items():
+        if old in df.columns and new not in df.columns:
+            df[new] = df[old]
+    for c in ["CMJ","RSI_mod","VMP","sRPE"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        else:
+            df[c] = np.nan
+    if "Jugador" not in df.columns:
+        df["Jugador"] = ""
+    if "Microciclo" not in df.columns:
+        df["Microciclo"] = ""
+    if "Posicion" not in df.columns:
+        df["Posicion"] = ""
+    if "Observaciones" not in df.columns:
+        df["Observaciones"] = ""
+    out = df[["Fecha","Jugador","Microciclo","Posicion","CMJ","RSI_mod","VMP","sRPE","Observaciones"]].copy()
+    out = _ensure_prepost_columns(out)
+    return out.sort_values(["Fecha","Jugador"]).reset_index(drop=True)
+
+
+def upsert_monitoring(df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    supabase = get_supabase()
+    rows = []
+    for _, r in df.iterrows():
+        note = r.get("Observaciones", "")
+        if pd.isna(note):
+            note = ""
+        if isinstance(note, str):
+            note, _old_meta = _clean_obs_and_meta(note)
+        else:
+            note = ""
+        meta = {}
+        cmj_post = _safe_float(r.get("CMJ_POST"))
+        rsi_post = _safe_float(r.get("RSI_MOD_POST"))
+        if pd.notna(cmj_post):
+            meta["cmj_post"] = round(float(cmj_post), 6)
+        if pd.notna(rsi_post):
+            meta["rsi_mod_post"] = round(float(rsi_post), 6)
+        obs_final = _compose_obs(note, meta)
+        fecha = pd.to_datetime(r.get("Fecha"), errors="coerce")
+        rows.append({
+            "fecha": None if pd.isna(fecha) else fecha.strftime("%Y-%m-%d"),
+            "jugador": r.get("Jugador", ""),
+            "microciclo": r.get("Microciclo", ""),
+            "posicion": r.get("Posicion", "") if pd.notna(r.get("Posicion", "")) else "",
+            "cmj": None if pd.isna(pd.to_numeric(pd.Series([r.get("CMJ")]), errors="coerce").iloc[0]) else float(pd.to_numeric(pd.Series([r.get("CMJ")]), errors="coerce").iloc[0]),
+            "rsi_mod": None if pd.isna(pd.to_numeric(pd.Series([r.get("RSI_mod")]), errors="coerce").iloc[0]) else float(pd.to_numeric(pd.Series([r.get("RSI_mod")]), errors="coerce").iloc[0]),
+            "vmp": None if pd.isna(pd.to_numeric(pd.Series([r.get("VMP")]), errors="coerce").iloc[0]) else float(pd.to_numeric(pd.Series([r.get("VMP")]), errors="coerce").iloc[0]),
+            "srpe": None if pd.isna(pd.to_numeric(pd.Series([r.get("sRPE")]), errors="coerce").iloc[0]) else float(pd.to_numeric(pd.Series([r.get("sRPE")]), errors="coerce").iloc[0]),
+            "observaciones": obs_final,
+        })
+    if rows:
+        supabase.table(SUPABASE_MONITORING_TABLE).upsert(rows, on_conflict="fecha,jugador").execute()
+
+
+def _normalize_var_name(raw):
+    s = "" if raw is None or (isinstance(raw, float) and pd.isna(raw)) else str(raw).strip().lower()
+    s = s.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+    s = re.sub(r"\s+", " ", s)
+    if "cmj" in s:
+        return "CMJ"
+    if "rsi" in s:
+        return "RSI_mod"
+    if "vmp" in s or "velocidad" in s or "barra" in s:
+        return "VMP"
+    if "srpe" in s or "rpe" in s:
+        return "sRPE"
+    return None
+
+
+def _parse_vertical_prepost_sheet(df_sheet: pd.DataFrame) -> pd.DataFrame:
+    cols = {str(c).strip().upper(): c for c in df_sheet.columns}
+    required = ["NOMBRE", "VARIABLES", "PRE"]
+    if not all(k in cols for k in required):
+        return pd.DataFrame()
+    name_col = cols["NOMBRE"]
+    var_col = cols["VARIABLES"]
+    pre_col = cols["PRE"]
+    post_col = cols.get("POST")
+    records = {}
+    current_player = None
+    for _, row in df_sheet.iterrows():
+        raw_name = row.get(name_col)
+        if pd.notna(raw_name):
+            cand = str(raw_name).strip()
+            if cand and cand.upper() not in {"NOMBRE", "JUGADOR"}:
+                current_player = cand
+        var_raw = row.get(var_col)
+        metric = _normalize_var_name(var_raw)
+        if not current_player or metric is None:
+            continue
+        rec = records.setdefault(current_player, {
+            "Jugador": current_player,
+            "Posicion": "",
+            "CMJ": np.nan,
+            "RSI_mod": np.nan,
+            "VMP": np.nan,
+            "sRPE": np.nan,
+            "CMJ_POST": np.nan,
+            "RSI_MOD_POST": np.nan,
+            "Observaciones": "",
+        })
+        pre_val = _safe_float(row.get(pre_col))
+        post_val = _safe_float(row.get(post_col)) if post_col is not None else np.nan
+        if metric == "CMJ":
+            rec["CMJ"] = pre_val
+            rec["CMJ_POST"] = post_val
+        elif metric == "RSI_mod":
+            rec["RSI_mod"] = pre_val
+            rec["RSI_MOD_POST"] = post_val
+        elif metric == "VMP":
+            rec["VMP"] = pre_val
+        elif metric == "sRPE":
+            rec["sRPE"] = pre_val
+    out = pd.DataFrame(list(records.values()))
+    return out
+
+
+def parse_uploaded_fatigue(uploaded_file):
+    if uploaded_file is None:
+        return pd.DataFrame()
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    if raw is None:
+        return pd.DataFrame()
+
+    # 1) Intento estándar existente
+    try:
+        _buf = io.BytesIO(raw)
+        _buf.name = getattr(uploaded_file, "name", "uploaded_file")
+        std = _prev_parse_uploaded_fatigue(_buf)
+        if std is not None and not std.empty:
+            if "CMJ_POST" not in std.columns:
+                std["CMJ_POST"] = np.nan
+            if "RSI_MOD_POST" not in std.columns:
+                std["RSI_MOD_POST"] = np.nan
+            if "Observaciones" not in std.columns:
+                std["Observaciones"] = ""
+            return std
+    except Exception:
+        pass
+
+    # 2) Nuevo formato vertical PRE/POST
+    parsed_frames = []
+    try:
+        xls = pd.ExcelFile(io.BytesIO(raw))
+        for sheet in xls.sheet_names:
+            try:
+                df_sheet = pd.read_excel(io.BytesIO(raw), sheet_name=sheet)
+            except Exception:
+                continue
+            parsed = _parse_vertical_prepost_sheet(df_sheet)
+            if not parsed.empty:
+                parsed_frames.append(parsed)
+    except Exception:
+        return pd.DataFrame()
+
+    if not parsed_frames:
+        return pd.DataFrame()
+
+    out = pd.concat(parsed_frames, ignore_index=True)
+    for c in ["Jugador", "Posicion", "CMJ", "RSI_mod", "VMP", "sRPE", "CMJ_POST", "RSI_MOD_POST", "Observaciones"]:
+        if c not in out.columns:
+            out[c] = np.nan if c not in ["Jugador", "Posicion", "Observaciones"] else ""
+    return out[["Jugador", "Posicion", "CMJ", "RSI_mod", "VMP", "sRPE", "CMJ_POST", "RSI_MOD_POST", "Observaciones"]]
+
+
+def compute_metrics(df: pd.DataFrame, gps_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    df = df.copy()
+    if df.empty:
+        return df
+
+    if "Fecha" in df.columns:
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+        df = df.sort_values(["Jugador", "Fecha"]).reset_index(drop=True)
+    else:
+        df["Fecha"] = pd.NaT
+
+    weight_map = load_player_weights_map()
+    load_map = load_player_squat_load_map()
+
+    df["Peso_corporal"] = df["Jugador"].map(weight_map)
+    df["Carga_sentadilla"] = df["Jugador"].map(load_map)
+    df["CMJ_POST"] = pd.to_numeric(df.get("CMJ_POST", np.nan), errors="coerce")
+    df["RSI_MOD_POST"] = pd.to_numeric(df.get("RSI_MOD_POST", np.nan), errors="coerce")
+
+    for m in ALL_METRICS:
+        df[m] = pd.to_numeric(df.get(m, np.nan), errors="coerce")
+        df[f"baseline_{m}"] = np.nan
+        df[f"diff_baseline_{m}"] = np.nan
+        df[f"pct_vs_baseline_{m}"] = np.nan
+        df[f"ma3_{m}"] = np.nan
+        df[f"pct_vs_ma3_{m}"] = np.nan
+        df[f"z_{m}"] = np.nan
+
+    df["readiness"] = np.nan
+    df["risk_label"] = None
+    df["risk_order"] = len(RISK_ORDER)
+    df["objective_loss_mean_pct"] = np.nan
+    df["objective_loss_score"] = np.nan
+    df["objective_z_score"] = np.nan
+
+    def _baseline_hist(hist, metric):
+        if hist.empty:
+            return hist
+        mask = hist["Microciclo"].apply(is_baseline_day) if "Microciclo" in hist.columns else pd.Series([True]*len(hist), index=hist.index)
+        return hist.loc[mask]
+
+    for player, g in df.groupby("Jugador", sort=False):
+        idxs = g.index.tolist()
+        for j, idx in enumerate(idxs):
+            hist = df.loc[idxs[:j+1]].copy()
+            hist_base = _baseline_hist(hist, None)
+            obj_drops, obj_zs = [], []
+
+            for m in ALL_METRICS:
+                cur = df.at[idx, m]
+                hist_m = hist_base[m].dropna() if m in hist_base.columns else pd.Series(dtype=float)
+                if len(hist_m) > 0:
+                    base = float(hist_m.mean())
+                    df.at[idx, f"baseline_{m}"] = base
+                    if pd.notna(cur):
+                        diff = cur - base
+                        pct = np.nan if base == 0 else ((cur / base) - 1.0) * 100.0
+                        df.at[idx, f"diff_baseline_{m}"] = diff
+                        df.at[idx, f"pct_vs_baseline_{m}"] = pct
+                hist_prev_m = hist_base[m].dropna() if m in hist_base.columns else pd.Series(dtype=float)
+                if len(hist_prev_m) >= 3:
+                    ma3 = float(hist_prev_m.iloc[-3:].mean())
+                    df.at[idx, f"ma3_{m}"] = ma3
+                    if pd.notna(cur) and ma3 != 0:
+                        df.at[idx, f"pct_vs_ma3_{m}"] = ((cur / ma3) - 1.0) * 100.0
+                if len(hist_prev_m) >= 2:
+                    mu = float(hist_prev_m.mean())
+                    sd = float(hist_prev_m.std(ddof=0))
+                    z = 0.0 if sd == 0 else ((cur - mu) / sd if pd.notna(cur) else np.nan)
+                    df.at[idx, f"z_{m}"] = z
+                if m in OBJECTIVE_METRICS:
+                    pct = df.at[idx, f"pct_vs_baseline_{m}"]
+                    if pd.notna(pct):
+                        obj_drops.append(-pct)
+                    z_val = df.at[idx, f"z_{m}"]
+                    if pd.notna(z_val):
+                        obj_zs.append(z_val)
+
+            if obj_drops:
+                mean_drop = float(np.nanmean(obj_drops))
+                df.at[idx, "objective_loss_mean_pct"] = mean_drop
+                if mean_drop <= 2.5:
+                    loss_score = 0
+                elif mean_drop <= 5:
+                    loss_score = 1
+                elif mean_drop <= 10:
+                    loss_score = 2
+                else:
+                    loss_score = 3
+                df.at[idx, "objective_loss_score"] = loss_score
+                readiness = max(0.0, 10.0 - (mean_drop / 2.0))
+                df.at[idx, "readiness"] = readiness
+                if mean_drop <= 2.5:
+                    label = "Estado óptimo"
+                elif mean_drop <= 5:
+                    label = "Buen estado"
+                elif mean_drop <= 7.5:
+                    label = "Fatiga leve"
+                elif mean_drop <= 10:
+                    label = "Fatiga leve-moderada"
+                elif mean_drop <= 12.5:
+                    label = "Fatiga moderada"
+                elif mean_drop <= 15:
+                    label = "Fatiga moderada-alta"
+                else:
+                    label = "Fatiga crítica"
+                df.at[idx, "risk_label"] = label
+                df.at[idx, "risk_order"] = RISK_ORDER.index(label)
+            if obj_zs:
+                df.at[idx, "objective_z_score"] = float(np.nanmean(obj_zs))
+
+    if "VMP" in df.columns and "Carga_sentadilla" in df.columns:
+        v = pd.to_numeric(df["VMP"], errors="coerce")
+        carga = pd.to_numeric(df["Carga_sentadilla"], errors="coerce")
+        df["1RM_est"] = np.where(v.notna() & carga.notna() & (1.0278 - 0.0278 * v > 0), carga / (1.0278 - 0.0278 * v), np.nan)
+    else:
+        df["1RM_est"] = np.nan
+
+    peso = pd.to_numeric(df.get("Peso_corporal"), errors="coerce")
+    df["1RM_relativa"] = np.where(pd.notna(df["1RM_est"]) & peso.notna() & (peso > 0), df["1RM_est"] / peso, np.nan)
+
+    for metric_col, out_col in [("1RM_est", "1RM_est"), ("1RM_relativa", "1RM_relativa")]:
+        base_col = f"baseline_{out_col}"
+        diff_col = f"diff_baseline_{out_col}"
+        pct_col = f"pct_vs_baseline_{out_col}"
+        df[base_col] = np.nan
+        df[diff_col] = np.nan
+        df[pct_col] = np.nan
+        for player, g in df.groupby("Jugador", sort=False):
+            idxs = g.index.tolist()
+            for j, idx in enumerate(idxs):
+                hist = df.loc[idxs[:j+1]].copy()
+                mask = hist["Microciclo"].apply(is_baseline_day) if "Microciclo" in hist.columns else pd.Series([True]*len(hist), index=hist.index)
+                hist_vals = pd.to_numeric(hist.loc[mask, metric_col], errors="coerce").dropna()
+                cur = pd.to_numeric(pd.Series([df.at[idx, metric_col]]), errors="coerce").iloc[0]
+                if len(hist_vals) > 0:
+                    base = float(hist_vals.mean())
+                    df.at[idx, base_col] = base
+                    if pd.notna(cur):
+                        df.at[idx, diff_col] = cur - base
+                        if base != 0:
+                            df.at[idx, pct_col] = ((cur / base) - 1.0) * 100.0
+
+    return df
+
+
+def prepare_intrasession_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    tmp = df.copy()
+    if "Fecha" in tmp.columns:
+        tmp["Fecha"] = pd.to_datetime(tmp["Fecha"], errors="coerce")
+    tmp["CMJ"] = pd.to_numeric(tmp.get("CMJ"), errors="coerce")
+    tmp["RSI_mod"] = pd.to_numeric(tmp.get("RSI_mod"), errors="coerce")
+    tmp["CMJ_POST"] = pd.to_numeric(tmp.get("CMJ_POST"), errors="coerce")
+    tmp["RSI_MOD_POST"] = pd.to_numeric(tmp.get("RSI_MOD_POST"), errors="coerce")
+    tmp["CMJ_delta_abs"] = tmp["CMJ_POST"] - tmp["CMJ"]
+    tmp["RSI_delta_abs"] = tmp["RSI_MOD_POST"] - tmp["RSI_mod"]
+    tmp["CMJ_delta_pct"] = np.where(tmp["CMJ"].notna() & (tmp["CMJ"] != 0), (tmp["CMJ_POST"] / tmp["CMJ"] - 1.0) * 100.0, np.nan)
+    tmp["RSI_delta_pct"] = np.where(tmp["RSI_mod"].notna() & (tmp["RSI_mod"] != 0), (tmp["RSI_MOD_POST"] / tmp["RSI_mod"] - 1.0) * 100.0, np.nan)
+    return tmp
+
+
+def render_simple_stat_card(title, value, subtitle=""):
+    st.markdown(
+        f"""
+        <div style='border:1px solid #e5e7eb;border-radius:16px;padding:14px 16px;background:white;min-height:98px;'>
+            <div style='font-size:12px;color:#6b7280;font-weight:600;margin-bottom:6px;'>{title}</div>
+            <div style='font-size:18px;color:#111827;font-weight:800;line-height:1.2;'>{value}</div>
+            <div style='font-size:12px;color:#6b7280;margin-top:6px;'>{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def fig_team_prepost_bar(df_session: pd.DataFrame):
+    rows = []
+    if df_session["CMJ_delta_pct"].notna().any():
+        rows.append({"Métrica": "CMJ", "%": float(df_session["CMJ_delta_pct"].dropna().mean())})
+    if df_session["RSI_delta_pct"].notna().any():
+        rows.append({"Métrica": "RSI mod", "%": float(df_session["RSI_delta_pct"].dropna().mean())})
+    if not rows:
+        return None
+    d = pd.DataFrame(rows)
+    fig = px.bar(d, x="Métrica", y="%", text=d["%"].map(lambda x: f"{x:+.1f}%"))
+    fig.add_hline(y=0, line_dash="dot", line_color="black")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=360, margin=dict(l=20, r=20, t=20, b=20), yaxis_title="%")
+    return fig
+
+
+def fig_player_prepost_bars(pre_val, post_val, title, y_title=""):
+    if pd.isna(pre_val) or pd.isna(post_val):
+        return None
+    d = pd.DataFrame({"Momento": ["PRE", "POST"], "Valor": [pre_val, post_val]})
+    fig = px.bar(d, x="Momento", y="Valor", text=d["Valor"].map(lambda x: f"{x:.3f}" if abs(x) < 10 else f"{x:.1f}"))
+    fig.update_traces(textposition="outside")
+    fig.update_layout(title=title, height=320, margin=dict(l=20, r=20, t=60, b=20), yaxis_title=y_title)
+    return fig
+
+
+def fig_delta_history(player_hist: pd.DataFrame, metric_prefix: str, title: str):
+    pct_col = f"{metric_prefix}_delta_pct"
+    if pct_col not in player_hist.columns or player_hist[pct_col].dropna().empty:
+        return None
+    d = player_hist[["Fecha", pct_col]].dropna().copy()
+    d["Fecha"] = pd.to_datetime(d["Fecha"], errors="coerce")
+    fig = px.line(d, x="Fecha", y=pct_col, markers=True)
+    fig.add_hline(y=0, line_dash="dot", line_color="black")
+    fig.update_layout(title=title, height=320, margin=dict(l=20, r=20, t=60, b=20), yaxis_title="Δ % POST vs PRE")
+    return fig
+
+
+def fig_candlestick_player(player_hist: pd.DataFrame, pre_col: str, post_col: str, title: str, baseline_value=np.nan):
+    d = player_hist[["Fecha", pre_col, post_col]].dropna().copy()
+    if d.empty:
+        return None
+    d["Fecha"] = pd.to_datetime(d["Fecha"], errors="coerce")
+    d["open"] = d[pre_col]
+    d["close"] = d[post_col]
+    d["high"] = d[[pre_col, post_col]].max(axis=1)
+    d["low"] = d[[pre_col, post_col]].min(axis=1)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=d["Fecha"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
+        increasing_line_color="#16A34A", decreasing_line_color="#DC2626", name="Sesión"
+    ))
+    if pd.notna(baseline_value):
+        fig.add_hline(y=float(baseline_value), line_dash="dash", line_color="black", annotation_text="Baseline PRE", annotation_position="top left")
+    fig.update_layout(title=title, height=330, margin=dict(l=20, r=20, t=60, b=20), xaxis_title="Fecha")
+    return fig
+
+
+def render_team_intrasession_section(metrics_df: pd.DataFrame):
+    view = st.session_state.get("team_view_new", "Resumen semana")
+    if view != "Sesión concreta":
+        return
+    sel = st.session_state.get("team_sess_new")
+    if not sel:
+        return
+    tmp = prepare_intrasession_frame(metrics_df)
+    if tmp.empty:
+        return
+    date_val = pd.to_datetime(sel).date() if not isinstance(sel, tuple) else pd.to_datetime(sel[0]).date()
+    dsel = tmp[tmp["Fecha"].dt.date == date_val].copy()
+    has_any = dsel[["CMJ_POST", "RSI_MOD_POST"]].notna().any().any() if not dsel.empty else False
+    if not has_any:
+        return
+    st.markdown("## Respuesta intra-sesión · PRE vs POST")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        cmj_mean = dsel["CMJ_delta_pct"].dropna().mean() if dsel["CMJ_delta_pct"].notna().any() else np.nan
+        render_simple_stat_card("CMJ Δ medio", f"{cmj_mean:+.1f}%" if pd.notna(cmj_mean) else "—", "post vs pre")
+    with c2:
+        rsi_mean = dsel["RSI_delta_pct"].dropna().mean() if dsel["RSI_delta_pct"].notna().any() else np.nan
+        render_simple_stat_card("RSI Δ medio", f"{rsi_mean:+.1f}%" if pd.notna(rsi_mean) else "—", "post vs pre")
+    with c3:
+        render_simple_stat_card("CMJ post disponibles", int(dsel["CMJ_POST"].notna().sum()), "jugadores")
+    with c4:
+        render_simple_stat_card("RSI post disponibles", int(dsel["RSI_MOD_POST"].notna().sum()), "jugadores")
+    fig = fig_team_prepost_bar(dsel)
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_player_intrasession_section(metrics_df: pd.DataFrame):
+    sel_player = st.session_state.get("player_select_new")
+    view = st.session_state.get("player_view_new", "Resumen semana")
+    sel_session = st.session_state.get("player_sess_new")
+    if not sel_player or view != "Sesión concreta" or not sel_session:
+        return
+    tmp = prepare_intrasession_frame(metrics_df)
+    if tmp.empty:
+        return
+    p = tmp[tmp["Jugador"] == sel_player].copy()
+    if p.empty:
+        return
+    date_val = pd.to_datetime(sel_session).date() if not isinstance(sel_session, tuple) else pd.to_datetime(sel_session[0]).date()
+    row = p[p["Fecha"].dt.date == date_val].sort_values("Fecha").tail(1)
+    if row.empty:
+        return
+    row = row.iloc[0]
+    if pd.isna(row.get("CMJ_POST")) and pd.isna(row.get("RSI_MOD_POST")):
+        return
+
+    st.markdown("## Respuesta intra-sesión · PRE vs POST")
+    c1, c2 = st.columns(2)
+    with c1:
+        cmj_pre, cmj_post = row.get("CMJ"), row.get("CMJ_POST")
+        cmj_pct = row.get("CMJ_delta_pct")
+        cmj_abs = row.get("CMJ_delta_abs")
+        render_simple_stat_card(
+            "CMJ · PRE vs POST",
+            f"{cmj_pre:.1f} cm → {cmj_post:.1f} cm" if pd.notna(cmj_pre) and pd.notna(cmj_post) else "—",
+            (f"{cmj_pct:+.1f}% intra-sesión · cambio absoluto {cmj_abs:+.1f} cm" if pd.notna(cmj_pct) and pd.notna(cmj_abs) else "")
+        )
+    with c2:
+        rsi_pre, rsi_post = row.get("RSI_mod"), row.get("RSI_MOD_POST")
+        rsi_pct = row.get("RSI_delta_pct")
+        rsi_abs = row.get("RSI_delta_abs")
+        render_simple_stat_card(
+            "RSI mod · PRE vs POST",
+            f"{rsi_pre:.3f} → {rsi_post:.3f}" if pd.notna(rsi_pre) and pd.notna(rsi_post) else "—",
+            (f"{rsi_pct:+.1f}% intra-sesión · cambio absoluto {rsi_abs:+.3f}" if pd.notna(rsi_pct) and pd.notna(rsi_abs) else "")
+        )
+
+    mcols = st.columns(2)
+    fig_cmj_bar = fig_player_prepost_bars(row.get("CMJ"), row.get("CMJ_POST"), "CMJ · PRE vs POST", "cm")
+    fig_rsi_bar = fig_player_prepost_bars(row.get("RSI_mod"), row.get("RSI_MOD_POST"), "RSI mod · PRE vs POST")
+    with mcols[0]:
+        if fig_cmj_bar is not None:
+            st.plotly_chart(fig_cmj_bar, use_container_width=True)
+    with mcols[1]:
+        if fig_rsi_bar is not None:
+            st.plotly_chart(fig_rsi_bar, use_container_width=True)
+
+    player_hist = p.dropna(subset=["Fecha"]).sort_values("Fecha")
+    if player_hist[["CMJ_POST", "RSI_MOD_POST"]].notna().any().any():
+        st.markdown("## Histórico sesión a sesión · gráfico de velas")
+        base_cmj = pd.to_numeric(player_hist.loc[player_hist["Microciclo"].apply(is_baseline_day), "CMJ"], errors="coerce").dropna().mean()
+        base_rsi = pd.to_numeric(player_hist.loc[player_hist["Microciclo"].apply(is_baseline_day), "RSI_mod"], errors="coerce").dropna().mean()
+        ccols = st.columns(2)
+        fig_c1 = fig_candlestick_player(player_hist, "CMJ", "CMJ_POST", "CMJ · histórico sesión a sesión (PRE→POST)", base_cmj)
+        fig_c2 = fig_candlestick_player(player_hist, "RSI_mod", "RSI_MOD_POST", "RSI mod · histórico sesión a sesión (PRE→POST)", base_rsi)
+        with ccols[0]:
+            if fig_c1 is not None:
+                st.plotly_chart(fig_c1, use_container_width=True)
+        with ccols[1]:
+            if fig_c2 is not None:
+                st.plotly_chart(fig_c2, use_container_width=True)
+        dcols = st.columns(2)
+        fig_d1 = fig_delta_history(player_hist, "CMJ", "CMJ · Δ % POST vs PRE")
+        fig_d2 = fig_delta_history(player_hist, "RSI", "RSI mod · Δ % POST vs PRE")
+        # fix metric prefix for RSI helper
+        if fig_d2 is None:
+            fig_d2 = fig_delta_history(player_hist.rename(columns={"RSI_delta_pct": "RSI_delta_pct"}), "RSI", "RSI mod · Δ % POST vs PRE")
+        with dcols[0]:
+            if fig_d1 is not None:
+                st.plotly_chart(fig_d1, use_container_width=True)
+        with dcols[1]:
+            if fig_d2 is not None:
+                st.plotly_chart(fig_d2, use_container_width=True)
+
+
+def page_equipo(metrics_df: pd.DataFrame, gps_df: pd.DataFrame):
+    _prev_page_equipo(metrics_df, gps_df)
+    try:
+        render_team_intrasession_section(metrics_df)
+    except Exception as e:
+        st.warning(f"No se pudo renderizar la respuesta intra-sesión del equipo: {e}")
+
+
+def page_jugador(metrics_df: pd.DataFrame, gps_df: pd.DataFrame):
+    _prev_page_jugador(metrics_df, gps_df)
+    try:
+        render_player_intrasession_section(metrics_df)
+    except Exception as e:
+        st.warning(f"No se pudo renderizar la respuesta intra-sesión del jugador: {e}")
+
 if __name__ == "__main__":
     main()
