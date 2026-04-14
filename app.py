@@ -215,6 +215,32 @@ def get_player_position(player, metrics_df=None, gps_df=None):
                 return vals[0]
     return "Sin asignar"
 
+def load_player_weights_map():
+    df = load_player_profiles()
+    if df is None or df.empty or "jugador" not in df.columns or "peso_corporal" not in df.columns:
+        return {}
+    out = {}
+    for _, row in df.iterrows():
+        jugador = normalize_player_name(row.get("jugador"))
+        peso = pd.to_numeric(row.get("peso_corporal"), errors="coerce")
+        if jugador and pd.notna(peso) and float(peso) > 0:
+            out[jugador] = float(peso)
+    return out
+
+
+def load_player_squat_load_map():
+    df = load_player_profiles()
+    if df is None or df.empty or "jugador" not in df.columns or "carga_sentadilla" not in df.columns:
+        return {}
+    out = {}
+    for _, row in df.iterrows():
+        jugador = normalize_player_name(row.get("jugador"))
+        carga = pd.to_numeric(row.get("carga_sentadilla"), errors="coerce")
+        if jugador and pd.notna(carga) and float(carga) > 0:
+            out[jugador] = float(carga)
+    return out
+
+
 def build_player_display_options(metrics_df, gps_df):
     def _player_values(df):
         if df is None or df.empty:
