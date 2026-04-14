@@ -7020,7 +7020,79 @@ OBS_META_MARKER = "__APPMETA__"
 
 _prev_page_equipo = page_equipo
 _prev_page_jugador = page_jugador
-_prev_parse_uploaded_fatigue = parse_uploaded_fatigue
+def _prev_parse_uploaded_fatigue(uploaded_file):
+    file_name = getattr(uploaded_file, "name", "")
+    suffix = Path(file_name).suffix.lower()
+
+    if suffix in [".xlsx", ".xls"]:
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+            candidates = []
+            for sh in xls.sheet_names:
+                try:
+                    tmp = pd.read_excel(uploaded_file, sheet_name=sh)
+                    if any(str(c).strip().upper() in ["JUGADOR", "NOMBRE", "PLAYER"] for c in tmp.columns):
+                        candidates.append(tmp)
+                except Exception:
+                    continue
+            if not candidates:
+                for sh in xls.sheet_names:
+                    try:
+                        tmp = pd.read_excel(uploaded_file, sheet_name=sh, header=None)
+                        candidates.append(tmp)
+                    except Exception:
+                        continue
+            if not candidates:
+                return None
+            blocks = []
+            for df_raw in candidates:
+                block = parse_fatigue_excel_with_prepost(df_raw)
+                if block is not None and not block.empty:
+                    blocks.append(block)
+            return pd.concat(blocks, ignore_index=True) if blocks else None
+        except Exception:
+            return None
+
+    if suffix == ".csv":
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception:
+            try:
+                df = pd.read_csv(uploaded_file, sep=";")
+            except Exception:
+                return None
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        if "fecha" in cols and "jugador" in cols:
+            rename = {}
+            for low, real in cols.items():
+                if low == "fecha": rename[real] = "Fecha"
+                elif low == "jugador": rename[real] = "Jugador"
+                elif low in ["cmj", "cmj_pre"]: rename[real] = "CMJ"
+                elif low in ["rsi", "rsi mod", "rsi_mod", "rsi_mod_pre", "rsi mod pre"]: rename[real] = "RSImod"
+                elif low in ["vmp", "vmp_pre"]: rename[real] = "VMP"
+                elif low in ["microciclo", "dia", "día"]: rename[real] = "Microciclo"
+                elif low in ["carga_sentadilla", "carga sentadilla", "carga"]: rename[real] = "Carga_sentadilla"
+                elif low in ["peso_corporal", "peso corporal", "peso"]: rename[real] = "Peso_corporal"
+                elif low in ["s-rpe", "srpe", "rpe"]: rename[real] = "sRPE"
+                elif low in ["fase", "momento"]: rename[real] = "Fase"
+                elif low == "tipo": rename[real] = "Tipo"
+            out = df.rename(columns=rename).copy()
+            need = ["Fecha", "Jugador"]
+            if not all(c in out.columns for c in need):
+                return None
+            out["Fecha"] = out["Fecha"].apply(try_parse_date)
+            out["Jugador"] = out["Jugador"].apply(std_name)
+            for c in ["CMJ", "RSImod", "VMP", "Carga_sentadilla", "Peso_corporal", "sRPE"]:
+                if c in out.columns:
+                    out[c] = out[c].apply(safe_num)
+            if "Tipo" not in out.columns:
+                out["Tipo"] = "Fatigue"
+            if "Fase" not in out.columns:
+                out["Fase"] = "PRE"
+            return out
+        return None
+
+    return None
 
 
 def normalize_microcycle_label(value):
