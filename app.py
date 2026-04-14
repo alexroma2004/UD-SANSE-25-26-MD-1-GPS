@@ -538,6 +538,61 @@ def _safe_label_mode(df, candidates, default="Sin datos"):
     return s.mode().iloc[0] if not s.empty else default
 
 
+def enrich_metrics_for_legacy_views(df):
+    """Añade aliases y columnas de compatibilidad para las vistas antiguas del dashboard.
+    Evita KeyError sin alterar la lógica principal de cálculo.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    fecha_col = _pick_existing_column(out, ["Fecha", "fecha", "date", "session_date", "Fecha_dt"])
+    if fecha_col:
+        out["Fecha"] = pd.to_datetime(out[fecha_col], errors="coerce")
+    elif isinstance(out.index, pd.DatetimeIndex):
+        out["Fecha"] = pd.to_datetime(out.index, errors="coerce")
+
+    if "readiness_score" not in out.columns and "readiness" in out.columns:
+        out["readiness_score"] = pd.to_numeric(out["readiness"], errors="coerce")
+    elif "readiness_score" in out.columns:
+        out["readiness_score"] = pd.to_numeric(out["readiness_score"], errors="coerce")
+
+    if "fat_readiness_score" not in out.columns and "readiness_score" in out.columns:
+        out["fat_readiness_score"] = pd.to_numeric(out["readiness_score"], errors="coerce")
+
+    if "fat_objective_loss_score" not in out.columns and "objective_loss_score" in out.columns:
+        out["fat_objective_loss_score"] = pd.to_numeric(out["objective_loss_score"], errors="coerce")
+
+    if "fat_risk_label" not in out.columns and "risk_label" in out.columns:
+        out["fat_risk_label"] = out["risk_label"]
+
+    for metric in OBJECTIVE_METRICS:
+        new_col = f"pct_vs_baseline_{metric}"
+        old_col = f"{metric}_pct_vs_baseline"
+        if old_col not in out.columns and new_col in out.columns:
+            out[old_col] = pd.to_numeric(out[new_col], errors="coerce")
+        if new_col not in out.columns and old_col in out.columns:
+            out[new_col] = pd.to_numeric(out[old_col], errors="coerce")
+
+    need_weight = ("Peso_corporal" not in out.columns)
+    if not need_weight:
+        try:
+            need_weight = pd.to_numeric(out["Peso_corporal"], errors="coerce").isna().all()
+        except Exception:
+            need_weight = True
+    if need_weight:
+        peso = _resolve_weight_series(out)
+        if peso is None or peso.isna().all():
+            name_col = _pick_existing_column(out, ["Jugador", "jugador", "player"])
+            weight_map = load_player_weights_map()
+            if name_col and weight_map:
+                peso = out[name_col].apply(lambda x: weight_map.get(normalize_player_name(x), np.nan))
+        if peso is not None:
+            out["Peso_corporal"] = pd.to_numeric(peso, errors="coerce")
+
+    return out
+
+
 def _safe_alert_count(df, label_candidates, critical_labels):
     col = _pick_existing_column(df, label_candidates)
     if col is None or df is None or df.empty:
@@ -4327,6 +4382,8 @@ def main():
     base_df = standardize_player_names_in_frames(load_monitoring())
     gps_df = standardize_player_names_in_frames(load_gps())
     metrics_df = compute_metrics(base_df) if not base_df.empty else base_df.copy()
+    metrics_df = enrich_metrics_for_legacy_views(metrics_df) if not metrics_df.empty else metrics_df
+    metrics_df = enrich_metrics_for_legacy_views(metrics_df) if not metrics_df.empty else metrics_df
     globals()["LAST_METRICS_DF"] = metrics_df
     globals()["LAST_GPS_DF"] = gps_df
 
@@ -5141,6 +5198,7 @@ def main():
     base_df = standardize_player_names_in_frames(load_monitoring())
     gps_df = standardize_player_names_in_frames(load_gps())
     metrics_df = compute_metrics(base_df) if not base_df.empty else base_df.copy()
+    metrics_df = enrich_metrics_for_legacy_views(metrics_df) if not metrics_df.empty else metrics_df
     globals()["LAST_METRICS_DF"] = metrics_df
     globals()["LAST_GPS_DF"] = gps_df
     menu = st.sidebar.radio("Sección", ["Cargar datos","Equipo","Jugador","Informes","Administración"], key="main_menu_v4")
@@ -6163,6 +6221,7 @@ def main():
     base_df = standardize_player_names_in_frames(load_monitoring())
     gps_df = standardize_player_names_in_frames(load_gps())
     metrics_df = compute_metrics(base_df) if not base_df.empty else base_df.copy()
+    metrics_df = enrich_metrics_for_legacy_views(metrics_df) if not metrics_df.empty else metrics_df
     globals()["LAST_METRICS_DF"] = metrics_df
     globals()["LAST_GPS_DF"] = gps_df
 
@@ -7100,6 +7159,7 @@ def main():
     base_df = standardize_player_names_in_frames(load_monitoring())
     gps_df = standardize_player_names_in_frames(load_gps())
     metrics_df = compute_metrics(base_df) if not base_df.empty else base_df.copy()
+    metrics_df = enrich_metrics_for_legacy_views(metrics_df) if not metrics_df.empty else metrics_df
     globals()["LAST_METRICS_DF"] = metrics_df
     globals()["LAST_GPS_DF"] = gps_df
     menu = st.sidebar.radio("Sección", ["Cargar datos","Equipo","Perfil F-R","Jugador","Comparador","Lupa IA","Informes","Administración"], key="main_menu_merged")
