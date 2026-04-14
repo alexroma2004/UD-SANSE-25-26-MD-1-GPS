@@ -970,63 +970,81 @@ def normalize_player_name(x):
 def gps_num(x):
     if pd.isna(x):
         return np.nan
-    s = str(x).strip().replace(".", "").replace(",", ".")
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x).strip().replace("\xa0", "").replace(" ", "")
+    if s == "" or s.lower() in {"nan", "none", "null"}:
+        return np.nan
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
     try:
         return float(s)
     except Exception:
         return np.nan
 
+def _gps_shrink_large_value(x, ceiling):
+    if pd.isna(x):
+        return x
+    while x > ceiling:
+        x = x / 10.0
+    return x
 
-def gps_distance_km_to_m(series):
-    ser = pd.to_numeric(series, errors="coerce").copy()
-    valid = ser.dropna()
-    if valid.empty:
-        return ser
-    # Si los valores parecen venir en kilómetros (ej. 0.257), convertirlos a metros.
-    # Si ya están en metros (ej. 257), no tocar nada.
-    if valid.max() <= 5:
-        ser = ser * 1000.0
-    return ser
+def gps_distance_km_to_m(x):
+    if pd.isna(x):
+        return x
+    return x * 1000.0 if 0 < x < 20 else x
+
+def normalize_gps_columns(df):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    if "distance" in out.columns and "total_distance" not in out.columns:
+        out["total_distance"] = out["distance"]
+    if "time_played" in out.columns and "time" not in out.columns:
+        out["time"] = out["time_played"]
+
+    for col in ["total_distance", "distance", "hsr", "distance_vrange6", "sprints", "num_acc", "num_dec", "time", "time_played"]:
+        if col in out.columns:
+            out[col] = out[col].map(gps_num)
+
+    for col in ["total_distance", "distance"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: x / 1000.0 if pd.notna(x) and x > 200 else x)
+
+    for col in ["hsr", "distance_vrange6"]:
+        if col in out.columns:
+            out[col] = out[col].map(gps_distance_km_to_m)
+            out[col] = out[col].map(lambda x: _gps_shrink_large_value(x, 2500))
+
+    if "sprints" in out.columns:
+        out["sprints"] = out["sprints"].map(lambda x: _gps_shrink_large_value(x, 60))
+    for col in ["num_acc", "num_dec"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: _gps_shrink_large_value(x, 120))
+    for col in ["time", "time_played"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: _gps_shrink_large_value(x, 150))
+
+    return out
 
 def load_gps():
     supabase = get_supabase()
     try:
-        res = supabase.table(SUPABASE_GPS_TABLE).select("*").execute()
-        data = res.data if getattr(res, "data", None) else []
-    except Exception:
-        data = []
-    df = pd.DataFrame(data)
-    if df.empty:
-        return pd.DataFrame(columns=["Fecha","Microciclo","Jugador","Posicion","time_played",*GPS_METRICS,"source_type"])
-    rename_map = {
-        "fecha": "Fecha",
-        "microciclo": "Microciclo",
-        "jugador": "Jugador",
-        "posicion": "Posicion",
-        "time_played": "time_played",
-        "total_distance": "total_distance",
-        "hsr": "hsr",
-        "sprints": "sprints",
-        "distance_vrange6": "distance_vrange6",
-        "num_acc": "num_acc",
-        "num_dec": "num_dec",
-        "source_type": "source_type",
-        "updated_at": "updated_at",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    if "time_played" not in df.columns:
-        df["time_played"] = np.nan
-    for c in ["time_played", *GPS_METRICS]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "hsr" in df.columns:
-        df["hsr"] = gps_distance_km_to_m(df["hsr"])
-    if "distance_vrange6" in df.columns:
-        df["distance_vrange6"] = gps_distance_km_to_m(df["distance_vrange6"])
-    df["Jugador"] = df["Jugador"].astype(str).map(normalize_player_name)
-    return df.sort_values(["Fecha","Microciclo","Jugador"]).reset_index(drop=True)
-
+        response = supabase.table(SUPABASE_GPS_TABLE).select("*").execute()
+        rows = response.data if getattr(response, "data", None) else []
+        if not rows:
+            return pd.DataFrame(columns=["Fecha", "Jugador", "Posicion", "Microciclo", "total_distance", "hsr", "distance_vrange6", "sprints", "num_acc", "num_dec", "time"])
+        df = ensure_gps_datetime(pd.DataFrame(rows))
+        return normalize_gps_columns(df)
+    except Exception as e:
+        st.warning(f"No se pudo cargar GPS desde Supabase: {e}")
+        return pd.DataFrame(columns=["Fecha", "Jugador", "Posicion", "Microciclo", "total_distance", "hsr", "distance_vrange6", "sprints", "num_acc", "num_dec", "time"])
 def upsert_gps(df):
     if df.empty:
         return
@@ -1130,7 +1148,7 @@ def parse_gps_uploaded(uploaded_file, fecha, microciclo):
     return out.drop_duplicates(subset=["Fecha","Microciclo","Jugador"], keep="last")
 
 def build_match_profile(gps_df):
-    gps_df = ensure_gps_datetime(gps_df)
+    gps_df = normalize_gps_columns(ensure_gps_datetime(gps_df))
     base_cols = ["Jugador", "Posicion", "profile_source", "qualified_matches", *[f"{m}_match" for m in GPS_METRICS]]
     if gps_df.empty:
         return pd.DataFrame(columns=base_cols)
