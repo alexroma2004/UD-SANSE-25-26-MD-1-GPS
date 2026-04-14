@@ -215,9 +215,17 @@ def get_player_position(player, metrics_df=None, gps_df=None):
                 return vals[0]
     return "Sin asignar"
 
+def _profiles_result_to_df(result):
+    """Normaliza la salida de load_player_profiles().
+    Puede devolver un DataFrame directo o una tupla (df, error).
+    """
+    df = result[0] if isinstance(result, tuple) else result
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+
 def load_player_weights_map():
-    df = load_player_profiles()
-    if df is None or df.empty or "jugador" not in df.columns or "peso_corporal" not in df.columns:
+    df = _profiles_result_to_df(load_player_profiles())
+    if df.empty or "jugador" not in df.columns or "peso_corporal" not in df.columns:
         return {}
     out = {}
     for _, row in df.iterrows():
@@ -229,8 +237,8 @@ def load_player_weights_map():
 
 
 def load_player_squat_load_map():
-    df = load_player_profiles()
-    if df is None or df.empty or "jugador" not in df.columns or "carga_sentadilla" not in df.columns:
+    df = _profiles_result_to_df(load_player_profiles())
+    if df.empty or "jugador" not in df.columns or "carga_sentadilla" not in df.columns:
         return {}
     out = {}
     for _, row in df.iterrows():
