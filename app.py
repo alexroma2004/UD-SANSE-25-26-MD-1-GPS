@@ -7856,5 +7856,359 @@ def page_jugador(metrics_df: pd.DataFrame, gps_df: pd.DataFrame):
     except Exception as e:
         st.warning(f"No se pudo renderizar la respuesta intra-sesión del jugador: {e}")
 
+
+def _safe_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    alias_pairs = {
+        "readiness": "readiness_score",
+        "1RM_relativa": "1RM_rel",
+        "1RM_rel_est": "1RM_rel",
+        "1RM_relativa_estimada": "1RM_rel",
+        "1RM_relativa_est": "1RM_rel",
+        "1RM_relativa_estim": "1RM_rel",
+        "1RM_estimada": "1RM_est",
+    }
+    for src, dst in alias_pairs.items():
+        if src in out.columns and dst not in out.columns:
+            out[dst] = out[src]
+    defaults = {
+        "Fecha": pd.NaT,
+        "Jugador": "",
+        "CMJ": np.nan,
+        "RSI_mod": np.nan,
+        "VMP": np.nan,
+        "1RM_est": np.nan,
+        "1RM_rel": np.nan,
+        "readiness_score": np.nan,
+        "objective_loss_score": np.nan,
+        "objective_z_score": np.nan,
+        "risk_label": "Sin datos",
+        "CMJ_POST": np.nan,
+        "RSI_MOD_POST": np.nan,
+        "CMJ_delta_abs": np.nan,
+        "CMJ_delta_pct": np.nan,
+        "RSI_delta_abs": np.nan,
+        "RSI_delta_pct": np.nan,
+        "FatigaMomento": "PRE",
+        "Microciclo": "",
+    }
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    if "Fecha" in out.columns:
+        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce")
+    for col in [
+        "CMJ", "RSI_mod", "VMP", "1RM_est", "1RM_rel", "readiness_score",
+        "objective_loss_score", "objective_z_score", "CMJ_POST", "RSI_MOD_POST",
+        "CMJ_delta_abs", "CMJ_delta_pct", "RSI_delta_abs", "RSI_delta_pct"
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def parse_uploaded(uploaded_file):
+    try:
+        df = parse_uploaded_fatigue(uploaded_file)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    return _prev_parse_uploaded_fatigue(uploaded_file)
+
+
+def weekly_global_summary(metrics_df, gps_df, week_ws):
+    metrics_df = _safe_metric_columns(metrics_df)
+    gps_df = gps_df.copy() if gps_df is not None else pd.DataFrame()
+    fat = metrics_df[(metrics_df["Fecha"] >= week_ws) & (metrics_df["Fecha"] <= week_ws + pd.Timedelta(days=6))].copy()
+    if fat.empty:
+        return {
+            "readiness_mean": np.nan,
+            "objective_loss_mean": np.nan,
+            "cmj_mean": np.nan,
+            "rsi_mean": np.nan,
+            "vmp_mean": np.nan,
+            "gps_rows": 0,
+            "fat_rows": 0,
+        }
+    return {
+        "readiness_mean": float(pd.to_numeric(fat.get("readiness_score"), errors="coerce").mean()) if "readiness_score" in fat.columns else np.nan,
+        "objective_loss_mean": float(pd.to_numeric(fat.get("objective_loss_score"), errors="coerce").mean()) if "objective_loss_score" in fat.columns else np.nan,
+        "cmj_mean": float(pd.to_numeric(fat.get("CMJ"), errors="coerce").mean()) if "CMJ" in fat.columns else np.nan,
+        "rsi_mean": float(pd.to_numeric(fat.get("RSI_mod"), errors="coerce").mean()) if "RSI_mod" in fat.columns else np.nan,
+        "vmp_mean": float(pd.to_numeric(fat.get("VMP"), errors="coerce").mean()) if "VMP" in fat.columns else np.nan,
+        "gps_rows": int(len(gps_df[(pd.to_datetime(gps_df.get("Fecha"), errors="coerce") >= week_ws) & (pd.to_datetime(gps_df.get("Fecha"), errors="coerce") <= week_ws + pd.Timedelta(days=6))])) if gps_df is not None and not gps_df.empty and "Fecha" in gps_df.columns else 0,
+        "fat_rows": int(len(fat)),
+    }
+
+
+def compute_integrated_player_snapshot(player, week_ws, metrics_df, gps_df):
+    metrics_df = _safe_metric_columns(metrics_df)
+    out = {
+        "player": player,
+        "week_start": week_ws,
+        "fat_week_readiness": np.nan,
+        "fat_week_loss": np.nan,
+        "fat_last_cmj": np.nan,
+        "fat_last_rsi": np.nan,
+        "fat_last_vmp": np.nan,
+        "fat_risk_label": "Sin datos",
+        "gps_week_distance": np.nan,
+        "gps_week_hsr": np.nan,
+        "gps_week_sprint": np.nan,
+        "gps_week_acc": np.nan,
+        "gps_week_dec": np.nan,
+        "gps_sessions": 0,
+    }
+    if metrics_df is not None and not metrics_df.empty and "Jugador" in metrics_df.columns:
+        week_fat = metrics_df[
+            (metrics_df["Jugador"] == player)
+            & (metrics_df["Fecha"] >= week_ws)
+            & (metrics_df["Fecha"] <= week_ws + pd.Timedelta(days=6))
+        ].copy()
+        if not week_fat.empty:
+            if "readiness_score" in week_fat.columns:
+                out["fat_week_readiness"] = float(pd.to_numeric(week_fat["readiness_score"], errors="coerce").mean())
+            if "objective_loss_score" in week_fat.columns:
+                out["fat_week_loss"] = float(pd.to_numeric(week_fat["objective_loss_score"], errors="coerce").mean())
+            last = week_fat.sort_values("Fecha").tail(1).iloc[0]
+            out["fat_last_cmj"] = float(pd.to_numeric(pd.Series([last.get("CMJ")]), errors="coerce").iloc[0]) if pd.notna(last.get("CMJ")) else np.nan
+            out["fat_last_rsi"] = float(pd.to_numeric(pd.Series([last.get("RSI_mod")]), errors="coerce").iloc[0]) if pd.notna(last.get("RSI_mod")) else np.nan
+            out["fat_last_vmp"] = float(pd.to_numeric(pd.Series([last.get("VMP")]), errors="coerce").iloc[0]) if pd.notna(last.get("VMP")) else np.nan
+            out["fat_risk_label"] = str(last.get("risk_label", "Sin datos"))
+    if gps_df is not None and not gps_df.empty and "Jugador" in gps_df.columns and "Fecha" in gps_df.columns:
+        g = gps_df.copy()
+        g["Fecha"] = pd.to_datetime(g["Fecha"], errors="coerce")
+        week_gps = g[(g["Jugador"] == player) & (g["Fecha"] >= week_ws) & (g["Fecha"] <= week_ws + pd.Timedelta(days=6))].copy()
+        if not week_gps.empty:
+            out["gps_sessions"] = int(len(week_gps))
+            for src, dst in [("distance", "gps_week_distance"), ("hsr", "gps_week_hsr"), ("sprints", "gps_week_sprint"), ("acc", "gps_week_acc"), ("dec", "gps_week_dec")]:
+                if src in week_gps.columns:
+                    out[dst] = float(pd.to_numeric(week_gps[src], errors="coerce").sum())
+    return out
+
+
+def build_force_reactivity_df(metrics_df: pd.DataFrame, selected_date) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    metrics_df = _safe_metric_columns(metrics_df)
+    try:
+        profiles_df, profiles_err = load_player_profiles()
+    except Exception as e:
+        profiles_df, profiles_err = pd.DataFrame(), str(e)
+    if metrics_df.empty:
+        return pd.DataFrame(), profiles_df if isinstance(profiles_df, pd.DataFrame) else pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    selected_ts = pd.to_datetime(selected_date, errors="coerce")
+    latest = metrics_df[metrics_df["Fecha"] <= selected_ts].copy() if pd.notna(selected_ts) else metrics_df.copy()
+    if latest.empty:
+        return latest, profiles_df if isinstance(profiles_df, pd.DataFrame) else pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    latest = latest.sort_values(["Jugador", "Fecha"]).groupby("Jugador", as_index=False).tail(1).copy()
+    if not isinstance(profiles_df, pd.DataFrame) or profiles_df.empty:
+        merged = latest.copy()
+        merged["Peso_corporal"] = np.nan
+        merged["Carga_sentadilla"] = np.nan
+    else:
+        tmp = profiles_df.copy()
+        rename_map = {}
+        if "jugador" in tmp.columns and "Jugador" not in tmp.columns:
+            rename_map["jugador"] = "Jugador"
+        if "peso_corporal" in tmp.columns and "Peso_corporal" not in tmp.columns:
+            rename_map["peso_corporal"] = "Peso_corporal"
+        if "carga_sentadilla" in tmp.columns and "Carga_sentadilla" not in tmp.columns:
+            rename_map["carga_sentadilla"] = "Carga_sentadilla"
+        tmp = tmp.rename(columns=rename_map)
+        for col in ["Jugador", "Peso_corporal", "Carga_sentadilla"]:
+            if col not in tmp.columns:
+                tmp[col] = np.nan if col != "Jugador" else ""
+        merged = latest.merge(tmp[["Jugador", "Peso_corporal", "Carga_sentadilla"]], on="Jugador", how="left")
+    merged["Peso_corporal"] = pd.to_numeric(merged.get("Peso_corporal"), errors="coerce")
+    merged["Carga_sentadilla"] = pd.to_numeric(merged.get("Carga_sentadilla"), errors="coerce")
+    merged["CMJ"] = pd.to_numeric(merged.get("CMJ"), errors="coerce")
+    merged["RSI_mod"] = pd.to_numeric(merged.get("RSI_mod"), errors="coerce")
+    merged["1RM_est"] = pd.to_numeric(merged.get("1RM_est"), errors="coerce")
+    merged["1RM_rel"] = pd.to_numeric(merged.get("1RM_rel"), errors="coerce")
+    profiles_ok = merged[(merged["Peso_corporal"].notna()) & (merged["Peso_corporal"] > 0)].copy()
+    profiles_ok["1RM_rel_real"] = np.where(profiles_ok["1RM_est"].notna(), profiles_ok["1RM_est"] / profiles_ok["Peso_corporal"], np.nan)
+    rsi_ref = profiles_ok[["Jugador", "RSI_mod"]].dropna().copy()
+    rel_ref = profiles_ok[["Jugador", "1RM_rel_real"]].rename(columns={"1RM_rel_real": "1RM_rel"}).dropna().copy()
+    return merged, profiles_df if isinstance(profiles_df, pd.DataFrame) else pd.DataFrame(), rsi_ref, rel_ref
+
+
+_orig_page_equipo = page_equipo
+_orig_page_jugador = page_jugador
+_orig_page_force_reactivity = page_force_reactivity
+_orig_page_comparador = page_comparador
+_orig_page_informes = page_informes
+
+
+def _fallback_team_page(metrics_df, gps_df):
+    metrics_df = _safe_metric_columns(metrics_df)
+    gps_df = gps_df.copy() if gps_df is not None else pd.DataFrame()
+    week_options = get_week_options(metrics_df if not metrics_df.empty else gps_df)
+    if not week_options:
+        st.info("No hay datos suficientes todavía.")
+        return
+    labels = [lab for lab, _ in week_options]
+    label_map = {lab: ws for lab, ws in week_options}
+    sel = st.selectbox("Semana (lunes-domingo)", labels, key="team_fallback_week")
+    week_ws = label_map[sel]
+    summary = weekly_global_summary(metrics_df, gps_df, week_ws)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Readiness media", f"{summary['readiness_mean']:.1f}" if pd.notna(summary['readiness_mean']) else "—")
+    c2.metric("Loss score medio", f"{summary['objective_loss_mean']:.1f}" if pd.notna(summary['objective_loss_mean']) else "—")
+    c3.metric("Sesiones fatiga", int(summary['fat_rows']))
+    c4.metric("Sesiones GPS", int(summary['gps_rows']))
+    week_df = metrics_df[(metrics_df["Fecha"] >= week_ws) & (metrics_df["Fecha"] <= week_ws + pd.Timedelta(days=6))].copy()
+    if not week_df.empty:
+        agg = week_df.groupby("Jugador", as_index=False).agg({
+            "readiness_score": "mean",
+            "objective_loss_score": "mean",
+            "CMJ": "mean",
+            "RSI_mod": "mean",
+            "VMP": "mean",
+        })
+        st.dataframe(agg.sort_values("readiness_score", ascending=False), use_container_width=True)
+        render_team_intrasession_section(metrics_df, week_ws)
+    else:
+        st.info("No hay datos de fatiga en la semana seleccionada.")
+
+
+def _fallback_player_page(metrics_df, gps_df):
+    metrics_df = _safe_metric_columns(metrics_df)
+    if metrics_df.empty or metrics_df["Jugador"].dropna().empty:
+        st.info("No hay datos de jugador todavía.")
+        return
+    players = sorted([p for p in metrics_df["Jugador"].dropna().astype(str).unique().tolist() if p])
+    player = st.selectbox("Selecciona jugador", players, key="player_fallback_player")
+    week_options = get_week_options(metrics_df)
+    labels = [lab for lab, _ in week_options] if week_options else []
+    label_map = {lab: ws for lab, ws in week_options}
+    if labels:
+        sel = st.selectbox("Semana (lunes-domingo)", labels, key="player_fallback_week")
+        week_ws = label_map[sel]
+    else:
+        week_ws = pd.to_datetime(metrics_df["Fecha"], errors="coerce").dropna().max().normalize()
+    p = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha")
+    latest = p.tail(1)
+    if not latest.empty:
+        row = latest.iloc[0]
+        cols = st.columns(5)
+        cols[0].metric("CMJ", f"{row['CMJ']:.1f}" if pd.notna(row.get('CMJ')) else "—")
+        cols[1].metric("RSI mod", f"{row['RSI_mod']:.3f}" if pd.notna(row.get('RSI_mod')) else "—")
+        cols[2].metric("VMP", f"{row['VMP']:.3f}" if pd.notna(row.get('VMP')) else "—")
+        cols[3].metric("Readiness", f"{row['readiness_score']:.1f}" if pd.notna(row.get('readiness_score')) else "—")
+        cols[4].metric("Loss score", f"{row['objective_loss_score']:.1f}" if pd.notna(row.get('objective_loss_score')) else "—")
+    week_df = p[(p["Fecha"] >= week_ws) & (p["Fecha"] <= week_ws + pd.Timedelta(days=6))].copy()
+    if not week_df.empty:
+        st.subheader("Resumen semanal")
+        show_cols = [c for c in ["Fecha", "Microciclo", "FatigaMomento", "CMJ", "RSI_mod", "VMP", "readiness_score", "objective_loss_score", "risk_label"] if c in week_df.columns]
+        st.dataframe(week_df[show_cols].sort_values("Fecha"), use_container_width=True)
+        render_player_intrasession_section(player, metrics_df, week_ws)
+    else:
+        st.info("No hay datos del jugador en la semana seleccionada.")
+
+
+def _fallback_force_page(metrics_df):
+    metrics_df = _safe_metric_columns(metrics_df)
+    dates = sorted(pd.to_datetime(metrics_df["Fecha"], errors="coerce").dropna().dt.date.unique().tolist()) if not metrics_df.empty else []
+    if not dates:
+        st.info("No hay datos suficientes para el perfil F-R.")
+        return
+    selected_date = st.selectbox("Fecha de análisis del perfil", dates, key="fr_fallback_date")
+    merged, profiles_df, rsi_ref, rel_ref = build_force_reactivity_df(metrics_df, selected_date)
+    if merged.empty:
+        st.info("No hay datos para esa fecha.")
+        return
+    plot_df = merged[[c for c in ["Jugador", "RSI_mod", "1RM_rel", "CMJ"] if c in merged.columns]].copy()
+    plot_df = plot_df.dropna(subset=[c for c in ["RSI_mod", "1RM_rel"] if c in plot_df.columns])
+    if plot_df.empty:
+        st.info("Faltan datos de RSI mod o 1RM relativa para construir el perfil.")
+        return
+    fig = px.scatter(plot_df, x="1RM_rel", y="RSI_mod", hover_name="Jugador")
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(plot_df, use_container_width=True)
+
+
+def _fallback_comparador_page(metrics_df):
+    metrics_df = _safe_metric_columns(metrics_df)
+    if metrics_df.empty:
+        st.info("No hay datos para comparar.")
+        return
+    players = sorted([p for p in metrics_df["Jugador"].dropna().astype(str).unique().tolist() if p])
+    if len(players) < 2:
+        st.info("Se necesitan al menos dos jugadores con datos.")
+        return
+    c1, c2 = st.columns(2)
+    p1 = c1.selectbox("Jugador A", players, index=0, key="cmp_fb_a")
+    p2 = c2.selectbox("Jugador B", players, index=min(1, len(players)-1), key="cmp_fb_b")
+    metric_options = [m for m in ["CMJ", "RSI_mod", "VMP", "readiness_score", "objective_loss_score"] if m in metrics_df.columns]
+    metric = st.selectbox("Métrica", metric_options, key="cmp_fb_metric")
+    fig = go.Figure()
+    for name in [p1, p2]:
+        dfp = metrics_df[metrics_df["Jugador"] == name].copy().sort_values("Fecha")
+        if dfp.empty:
+            continue
+        fig.add_trace(go.Scatter(x=dfp["Fecha"], y=pd.to_numeric(dfp[metric], errors="coerce"), mode="lines+markers", name=name))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _fallback_informes_page(metrics_df, gps_df):
+    metrics_df = _safe_metric_columns(metrics_df)
+    if metrics_df.empty:
+        st.info("No hay datos para generar informes.")
+        return
+    players = sorted([p for p in metrics_df["Jugador"].dropna().astype(str).unique().tolist() if p])
+    player = st.selectbox("Jugador", players, key="rep_fb_player")
+    dfp = metrics_df[metrics_df["Jugador"] == player].copy().sort_values("Fecha")
+    latest = dfp.tail(1).iloc[0] if not dfp.empty else None
+    if latest is not None:
+        st.markdown(
+            f"**Resumen actual:** {latest.get('risk_label', 'Sin datos')} · "
+            f"loss {pd.to_numeric(pd.Series([latest.get('objective_loss_score')]), errors='coerce').iloc[0]:.2f} · "
+            f"readiness {pd.to_numeric(pd.Series([latest.get('readiness_score')]), errors='coerce').iloc[0]:.1f}"
+        )
+    st.dataframe(dfp[[c for c in ["Fecha", "Microciclo", "FatigaMomento", "CMJ", "RSI_mod", "VMP", "readiness_score", "objective_loss_score", "risk_label"] if c in dfp.columns]], use_container_width=True)
+
+
+def page_equipo(metrics_df, gps_df):
+    try:
+        return _orig_page_equipo(metrics_df, gps_df)
+    except Exception as e:
+        st.warning(f"Se activó un modo seguro en Equipo por un error interno: {type(e).__name__}.")
+        _fallback_team_page(metrics_df, gps_df)
+
+
+def page_jugador(metrics_df, gps_df):
+    try:
+        return _orig_page_jugador(metrics_df, gps_df)
+    except Exception as e:
+        st.warning(f"Se activó un modo seguro en Jugador por un error interno: {type(e).__name__}.")
+        _fallback_player_page(metrics_df, gps_df)
+
+
+def page_force_reactivity(metrics_df, gps_df):
+    try:
+        return _orig_page_force_reactivity(metrics_df, gps_df)
+    except Exception as e:
+        st.warning(f"Se activó un modo seguro en Perfil F-R por un error interno: {type(e).__name__}.")
+        _fallback_force_page(metrics_df)
+
+
+def page_comparador(metrics_df):
+    try:
+        return _orig_page_comparador(metrics_df)
+    except Exception as e:
+        st.warning(f"Se activó un modo seguro en Comparador por un error interno: {type(e).__name__}.")
+        _fallback_comparador_page(metrics_df)
+
+
+def page_informes(metrics_df, gps_df):
+    try:
+        return _orig_page_informes(metrics_df, gps_df)
+    except Exception as e:
+        st.warning(f"Se activó un modo seguro en Informes por un error interno: {type(e).__name__}.")
+        _fallback_informes_page(metrics_df, gps_df)
+
+
 if __name__ == "__main__":
     main()
