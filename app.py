@@ -2064,27 +2064,73 @@ def radar_relative_loss(row):
 
 def plot_metric_main(player_df, metric, selected_date):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=player_df["Fecha"], y=player_df[metric], mode="lines+markers", name="Valor real", line=dict(color="#1F4E79", width=3)))
-    fig.add_trace(go.Scatter(x=player_df["Fecha"], y=player_df[f"{metric}_ma3"], mode="lines", name="MA3", line=dict(color="#64748B", width=3, dash="dash")))
-    fig.add_trace(go.Scatter(x=player_df["Fecha"], y=player_df[f"{metric}_baseline"], mode="lines", name="Baseline", line=dict(color="#0F766E", width=2, dash="dot")))
-    sel = player_df[player_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()]
+    local_df = player_df.copy().sort_values("Fecha").reset_index(drop=True)
+
+    # Recalcular solo para visualización para evitar cortes por columnas heredadas/antiguas
+    metric_vals = pd.to_numeric(local_df[metric], errors="coerce")
+    local_df[f"{metric}_ma3_vis"] = metric_vals.rolling(window=3, min_periods=1).mean()
+    local_df[f"{metric}_baseline_vis"] = progressive_filtered_baseline(local_df, metric)
+
+    fig.add_trace(go.Scatter(
+        x=local_df["Fecha"], y=metric_vals,
+        mode="lines+markers", name="Valor real",
+        line=dict(color="#1F4E79", width=3)
+    ))
+    fig.add_trace(go.Scatter(
+        x=local_df["Fecha"], y=local_df[f"{metric}_ma3_vis"],
+        mode="lines", name="MA3",
+        line=dict(color="#64748B", width=3, dash="dash")
+    ))
+    fig.add_trace(go.Scatter(
+        x=local_df["Fecha"], y=local_df[f"{metric}_baseline_vis"],
+        mode="lines", name="Baseline",
+        line=dict(color="#0F766E", width=2, dash="dot")
+    ))
+
+    sel = local_df[local_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()]
     if not sel.empty:
-        fig.add_trace(go.Scatter(x=sel["Fecha"], y=sel[metric], mode="markers", name="Fecha", marker=dict(size=12, color="#C62828", symbol="diamond")))
-    fig.update_layout(title=f"{LABELS[metric]} · valor real, MA3 y baseline", height=300, margin=dict(l=10,r=10,t=35,b=10))
+        fig.add_trace(go.Scatter(
+            x=sel["Fecha"], y=sel[metric],
+            mode="markers", name="Fecha",
+            marker=dict(size=12, color="#C62828", symbol="diamond")
+        ))
+    fig.update_layout(
+        title=f"{LABELS[metric]} · valor real, MA3 y baseline",
+        height=300, margin=dict(l=10,r=10,t=35,b=10)
+    )
     return fig
 
 def plot_metric_pct(player_df, metric, selected_date):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=player_df["Fecha"], y=player_df[f"{metric}_pct_vs_baseline"], mode="lines+markers", name="% vs baseline", line=dict(color="#1F4E79", width=3)))
-    sel = player_df[player_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()]
+    local_df = player_df.copy().sort_values("Fecha").reset_index(drop=True)
+    local_df[f"{metric}_baseline_vis"] = progressive_filtered_baseline(local_df, metric)
+    local_df[f"{metric}_pct_vs_baseline_vis"] = np.where(
+        local_df[f"{metric}_baseline_vis"].notna() & (local_df[f"{metric}_baseline_vis"] != 0),
+        (pd.to_numeric(local_df[metric], errors="coerce") - local_df[f"{metric}_baseline_vis"]) / local_df[f"{metric}_baseline_vis"] * 100,
+        np.nan,
+    )
+
+    fig.add_trace(go.Scatter(
+        x=local_df["Fecha"], y=local_df[f"{metric}_pct_vs_baseline_vis"],
+        mode="lines+markers", name="% vs baseline",
+        line=dict(color="#1F4E79", width=3)
+    ))
+    sel = local_df[local_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()]
     if not sel.empty:
-        fig.add_trace(go.Scatter(x=sel["Fecha"], y=sel[f"{metric}_pct_vs_baseline"], mode="markers", name="Fecha", marker=dict(size=12, color="#C62828", symbol="diamond")))
+        fig.add_trace(go.Scatter(
+            x=sel["Fecha"], y=sel[f"{metric}_pct_vs_baseline_vis"],
+            mode="markers", name="Fecha",
+            marker=dict(size=12, color="#C62828", symbol="diamond")
+        ))
     fig.add_hline(y=0, line_dash="dot")
     fig.add_hrect(y0=-2.5, y1=15, fillcolor="rgba(46,139,87,0.10)", line_width=0)
     fig.add_hrect(y0=-5, y1=-2.5, fillcolor="rgba(227,160,8,0.12)", line_width=0)
     fig.add_hrect(y0=-10, y1=-5, fillcolor="rgba(249,115,22,0.12)", line_width=0)
     fig.add_hrect(y0=-30, y1=-10, fillcolor="rgba(198,40,40,0.10)", line_width=0)
-    fig.update_layout(title=f"{LABELS[metric]} · % vs baseline", height=300, margin=dict(l=10,r=10,t=35,b=10))
+    fig.update_layout(
+        title=f"{LABELS[metric]} · % vs baseline",
+        height=300, margin=dict(l=10,r=10,t=35,b=10)
+    )
     return fig
 
 def plot_objective_timeline(player_df, selected_date):
