@@ -1574,6 +1574,16 @@ def plot_team_pre_post_delta(team_df):
     return fig
 def progressive_filtered_baseline(group, metric):
     out = []
+    group = group.copy()
+    if "Microciclo" in group.columns:
+        group["Microciclo"] = (
+            group["Microciclo"]
+            .fillna("MD-1")
+            .astype(str)
+            .str.strip()
+            .replace({"NA": "MD-1", "N/A": "MD-1", "None": "MD-1", "": "MD-1"})
+        )
+
     full_mean = pd.to_numeric(group[metric], errors="coerce").mean()
     has_micro = "Microciclo" in group.columns
 
@@ -1597,10 +1607,8 @@ def progressive_filtered_baseline(group, metric):
 
         prev[metric] = pd.to_numeric(prev[metric], errors="coerce")
 
-        # 1) MD-1 siempre incluido
         md1_vals = prev.loc[prev["Microciclo"] == "MD-1", metric].dropna().tolist()
 
-        # Si todavía no hay MD-1 histórico, mantenemos el comportamiento de respaldo
         if len(md1_vals) == 0:
             vals = prev[metric].dropna()
             out.append(vals.mean() if len(vals) > 0 else full_mean)
@@ -1609,10 +1617,9 @@ def progressive_filtered_baseline(group, metric):
         included = md1_vals.copy()
         provisional = float(pd.Series(included).mean())
 
-        # 2) MD-4, MD-3 y MD-2 solo si están en >= -5% respecto a la baseline provisional
         aux_days = prev[prev["Microciclo"].isin(["MD-4", "MD-3", "MD-2"])][metric].dropna().tolist()
         for v in aux_days:
-            pct_loss = ((v - provisional) / provisional) * 100 if provisional not in [0, np.nan] else np.nan
+            pct_loss = ((v - provisional) / provisional) * 100 if provisional != 0 else np.nan
             if pd.notna(pct_loss) and pct_loss >= -5:
                 included.append(v)
                 provisional = float(pd.Series(included).mean())
@@ -1622,13 +1629,8 @@ def progressive_filtered_baseline(group, metric):
     return pd.Series(out, index=group.index)
 
 def progressive_ma3_by_cycle(group, metric):
-    if "Microciclo" not in group.columns:
-        return pd.to_numeric(group[metric], errors="coerce").rolling(window=3, min_periods=1).mean()
-    out = pd.Series(index=group.index, dtype=float)
-    for cycle, sub in group.groupby("Microciclo", sort=False):
-        vals = pd.to_numeric(sub[metric], errors="coerce").rolling(window=3, min_periods=1).mean()
-        out.loc[sub.index] = vals.values
-    return out
+    vals = pd.to_numeric(group[metric], errors="coerce")
+    return vals.rolling(window=3, min_periods=1).mean()
 
 def compute_metrics(df):
     if df.empty:
