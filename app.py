@@ -2062,41 +2062,99 @@ def radar_relative_loss(row):
     )
     return fig
 
+
+def build_visual_ma3_series(player_df, metric):
+    vals = pd.to_numeric(player_df[metric], errors="coerce")
+    return vals.rolling(window=3, min_periods=1).mean()
+
+def build_visual_baseline_series(player_df, metric):
+    dfv = player_df.copy().reset_index(drop=True)
+    if "Microciclo" in dfv.columns:
+        dfv["Microciclo"] = (
+            dfv["Microciclo"]
+            .fillna("MD-1")
+            .astype(str)
+            .str.strip()
+            .replace({"NA": "MD-1", "N/A": "MD-1", "None": "MD-1", "": "MD-1"})
+        )
+
+    out = []
+    has_micro = "Microciclo" in dfv.columns
+
+    for i in range(len(dfv)):
+        hist = dfv.iloc[: i + 1].copy()
+        hist[metric] = pd.to_numeric(hist[metric], errors="coerce")
+
+        if not has_micro:
+            vals = hist[metric].dropna()
+            out.append(vals.mean() if len(vals) > 0 else np.nan)
+            continue
+
+        hist = hist[hist["Microciclo"].isin(VALID_BASELINE_DAYS)].copy()
+        if hist.empty:
+            out.append(np.nan)
+            continue
+
+        md1_vals = hist.loc[hist["Microciclo"] == "MD-1", metric].dropna().tolist()
+
+        if len(md1_vals) == 0:
+            vals = hist[metric].dropna()
+            out.append(vals.mean() if len(vals) > 0 else np.nan)
+            continue
+
+        included = md1_vals.copy()
+        provisional = float(pd.Series(included).mean()) if len(included) > 0 else np.nan
+
+        aux_days = hist[hist["Microciclo"].isin(["MD-4", "MD-3", "MD-2"])][metric].dropna().tolist()
+        for v in aux_days:
+            if pd.isna(provisional) or provisional == 0:
+                pct_loss = np.nan
+            else:
+                pct_loss = ((v - provisional) / provisional) * 100
+            if pd.notna(pct_loss) and pct_loss >= -5:
+                included.append(v)
+                provisional = float(pd.Series(included).mean())
+
+        out.append(float(pd.Series(included).mean()) if len(included) > 0 else np.nan)
+
+    return pd.Series(out, index=player_df.index)
+
+
 def plot_metric_main(player_df, metric, selected_date):
     fig = go.Figure()
-    local_df = player_df.copy().sort_values("Fecha").reset_index(drop=True)
 
-    # Recalcular solo para visualización para evitar cortes por columnas heredadas/antiguas
-    metric_vals = pd.to_numeric(local_df[metric], errors="coerce")
-    local_df[f"{metric}_ma3_vis"] = metric_vals.rolling(window=3, min_periods=1).mean()
-    local_df[f"{metric}_baseline_vis"] = progressive_filtered_baseline(local_df, metric)
+    visual_real = pd.to_numeric(player_df[metric], errors="coerce")
+    visual_ma3 = build_visual_ma3_series(player_df, metric)
+    visual_baseline = build_visual_baseline_series(player_df, metric)
 
     fig.add_trace(go.Scatter(
-        x=local_df["Fecha"], y=metric_vals,
+        x=player_df["Fecha"], y=visual_real,
         mode="lines+markers", name="Valor real",
         line=dict(color="#1F4E79", width=3)
     ))
     fig.add_trace(go.Scatter(
-        x=local_df["Fecha"], y=local_df[f"{metric}_ma3_vis"],
+        x=player_df["Fecha"], y=visual_ma3,
         mode="lines", name="MA3",
         line=dict(color="#64748B", width=3, dash="dash")
     ))
     fig.add_trace(go.Scatter(
-        x=local_df["Fecha"], y=local_df[f"{metric}_baseline_vis"],
+        x=player_df["Fecha"], y=visual_baseline,
         mode="lines", name="Baseline",
         line=dict(color="#0F766E", width=2, dash="dot")
     ))
 
-    sel = local_df[local_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()]
+    sel = player_df[player_df["Fecha"].dt.normalize() == pd.to_datetime(selected_date).normalize()]
     if not sel.empty:
         fig.add_trace(go.Scatter(
             x=sel["Fecha"], y=sel[metric],
             mode="markers", name="Fecha",
             marker=dict(size=12, color="#C62828", symbol="diamond")
         ))
+
     fig.update_layout(
         title=f"{LABELS[metric]} · valor real, MA3 y baseline",
-        height=300, margin=dict(l=10,r=10,t=35,b=10)
+        height=300,
+        margin=dict(l=10, r=10, t=35, b=10)
     )
     return fig
 
